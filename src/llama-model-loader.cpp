@@ -821,6 +821,13 @@ llama_model_loader::llama_model_loader(
         use_mmap = false;
     }
 
+    // CPU tensor parallelism shards weights with a strided (non-contiguous) per-row layout that
+    // cannot be zero-copied from mmap -> force a real read into allocated buffers.
+    if (tp_cfg.enabled && use_mmap) {
+        LLAMA_LOG_INFO("%s: tensor parallelism enabled (size=%d rank=%d) -> disabling mmap\n", __func__, tp_cfg.size, tp_cfg.rank);
+        use_mmap = false;
+    }
+
     this->use_mmap = use_mmap;
     this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
@@ -1049,6 +1056,22 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     }
 
     return nullptr;
+}
+
+// Which weights are sharded for CPU tensor parallelism, and how.
+// Start with FFN-only (the simplest correct slice): ffn_up/gate column-parallel (split output
+// rows, no comm), ffn_down row-parallel (split the contraction -> needs an all-reduce in the
+// graph). Attention stays replicated for now.
+static tp_shard_role tp_role_for_tensor(llm_tensor t) {
+    switch (t) {
+        case LLM_TENSOR_FFN_UP:
+        case LLM_TENSOR_FFN_GATE:
+            return TP_SHARD_COLUMN;
+        case LLM_TENSOR_FFN_DOWN:
+            return TP_SHARD_ROW;
+        default:
+            return TP_SHARD_NONE;
+    }
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
@@ -1281,8 +1304,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
-    ggml_set_name(tensor, ggml_get_name(cur));
+    // CPU tensor parallelism: create this rank's SHARD of the tensor (smaller ne), and record
+    // the load plan so load_data_for reads only the rank's slice from the GGUF.
+    struct ggml_tensor * tensor = nullptr;
+    tp_shard_role tp_role = tp_cfg.enabled ? tp_role_for_tensor(tn.tensor) : TP_SHARD_NONE;
+    tp_shard_plan tp_plan;
+    if (tp_role != TP_SHARD_NONE &&
+        tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, cur->ne[0], cur->ne[1],
+                           ggml_blck_size(cur->type), ggml_type_size(cur->type), &tp_plan) == 0) {
+        int64_t sne[GGML_MAX_DIMS] = { tp_plan.ne0, tp_plan.ne1, cur->ne[2], cur->ne[3] };
+        tensor = ggml_new_tensor(ctx, cur->type, ggml_n_dims(cur), sne);
+        ggml_set_name(tensor, ggml_get_name(cur));
+        tp_plans[ggml_get_name(cur)] = tp_plan;
+    } else {
+        tensor = ggml_dup_tensor(ctx, cur);
+        ggml_set_name(tensor, ggml_get_name(cur));
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(cur);
@@ -1391,6 +1428,28 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
 
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
+
+    // CPU tensor parallelism: gather this rank's slice. Row-parallel data is strided in the
+    // file (one chunk per output row), so it cannot be zero-copied from mmap -> require a real
+    // (allocated) buffer, i.e. --no-mmap when TP is enabled.
+    auto tp_it = tp_plans.find(ggml_get_name(cur));
+    if (tp_it != tp_plans.end()) {
+        const tp_shard_plan & pl = tp_it->second;
+        if (cur->data == nullptr) {
+            throw std::runtime_error(format("tensor parallelism requires --no-mmap (tensor '%s')", ggml_get_name(cur)));
+        }
+        uint8_t * dst = (uint8_t *) cur->data;
+        GGML_ASSERT(w.idx < files.size());
+        const auto & file = files.at(w.idx);
+        for (int64_t r = 0; r < pl.nrows; r++) {
+            file->seek(w.offs + pl.base_off + (size_t) r * pl.src_stride, SEEK_SET);
+            file->read_raw(dst + (size_t) r * pl.chunk_bytes, pl.chunk_bytes);
+        }
+        if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+        }
+        return;
+    }
 
     if (use_mmap) {
         const auto & mapping = mappings.at(w.idx);
@@ -1574,8 +1633,19 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
-                file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                // CPU tensor parallelism: gather this rank's (possibly strided) slice.
+                auto tp_it = tp_plans.find(ggml_get_name(cur));
+                if (tp_it != tp_plans.end()) {
+                    const tp_shard_plan & pl = tp_it->second;
+                    uint8_t * dst = (uint8_t *) cur->data;
+                    for (int64_t r = 0; r < pl.nrows; r++) {
+                        file->seek(weight->offs + pl.base_off + (size_t) r * pl.src_stride, SEEK_SET);
+                        file->read_raw(dst + (size_t) r * pl.chunk_bytes, pl.chunk_bytes);
+                    }
+                } else {
+                    file->seek(weight->offs, SEEK_SET);
+                    file->read_raw(cur->data, n_size);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));

@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-tp-net.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1734,6 +1735,13 @@ ggml_tensor * llm_graph_context::build_ffn(
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
+    }
+
+    // CPU tensor parallelism: ffn_down is row-parallel (weight sharded on the contraction dim),
+    // so each node holds a PARTIAL sum here. All-reduce across nodes to recover the full output.
+    if (down && llama_tp_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "ffn_down_tp", il);
     }
 
     if (down_b) {
