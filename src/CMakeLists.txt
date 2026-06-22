@@ -43,9 +43,16 @@ set(LLAMA_CORE_SOURCES
     unicode.cpp
 )
 
+# CPU tensor parallelism (C, and order-sensitive statics): kept out of the unity build below
+set(LLAMA_TP_SOURCES
+    llama-tp-shard.c
+    llama-tp-net.c
+)
+
 add_library(llama
             ../include/llama.h
             ${LLAMA_CORE_SOURCES}
+            ${LLAMA_TP_SOURCES}
             unicode.h
             ${LLAMA_MODELS_SOURCES}
             )
@@ -59,7 +66,7 @@ set_target_properties(llama PROPERTIES
 )
 
 # exclude non-model sources from unity build
-set_source_files_properties(${LLAMA_CORE_SOURCES} ../include/llama.h unicode.h
+set_source_files_properties(${LLAMA_CORE_SOURCES} ${LLAMA_TP_SOURCES} ../include/llama.h unicode.h
     PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 
 configure_file(llama-version.h.in ${CMAKE_CURRENT_BINARY_DIR}/llama-version.h @ONLY)
@@ -69,6 +76,16 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# Optional inter-node tensor parallelism over UCX/IB. Enable by passing the UCX paths, e.g.:
+#   -DTP_UCX_INC=<ucx-dev>/include -DTP_UCX_LIB=<ucx>/lib
+if (DEFINED TP_UCX_LIB)
+    message(STATUS "llama: CPU tensor parallelism UCX backend enabled (${TP_UCX_LIB})")
+    target_include_directories(llama PRIVATE ${TP_UCX_INC})
+    target_link_libraries(llama PRIVATE ${TP_UCX_LIB}/libucp.so ${TP_UCX_LIB}/libucs.so)
+    target_link_options(llama PRIVATE -Wl,-rpath,${TP_UCX_LIB})
+    set_property(SOURCE llama-tp-net.c PROPERTY COMPILE_DEFINITIONS LLAMA_TP_UCX=1)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
