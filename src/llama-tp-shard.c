@@ -2,14 +2,16 @@
 #include <stdlib.h>
 
 tp_shard_config tp_shard_from_env(void) {
-    tp_shard_config c = {1, 0, 0};
+    tp_shard_config c = {1, 0, 0, 0};
     const char * s = getenv("LLAMA_TP_SIZE");
     const char * r = getenv("LLAMA_TP_RANK");
+    const char * a = getenv("LLAMA_TP_ATTN");
     if (s) c.size = atoi(s);
     if (r) c.rank = atoi(r);
     if (c.size < 1) c.size = 1;
     if (c.rank < 0 || c.rank >= c.size) c.rank = 0;
     c.enabled = (c.size > 1);
+    c.attn = (c.enabled && a && atoi(a) != 0);
     return c;
 }
 
