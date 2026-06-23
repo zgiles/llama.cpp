@@ -2,16 +2,18 @@
 #include <stdlib.h>
 
 tp_shard_config tp_shard_from_env(void) {
-    tp_shard_config c = {1, 0, 0, 0};
+    tp_shard_config c = {1, 0, 0, 0, 0};
     const char * s = getenv("LLAMA_TP_SIZE");
     const char * r = getenv("LLAMA_TP_RANK");
     const char * a = getenv("LLAMA_TP_ATTN");
+    const char * m = getenv("LLAMA_TP_MOE");
     if (s) c.size = atoi(s);
     if (r) c.rank = atoi(r);
     if (c.size < 1) c.size = 1;
     if (c.rank < 0 || c.rank >= c.size) c.rank = 0;
     c.enabled = (c.size > 1);
     c.attn = (c.enabled && a && atoi(a) != 0);
+    c.moe  = (c.enabled && m && atoi(m) != 0);
     return c;
 }
 
@@ -21,9 +23,10 @@ static size_t row_bytes(int64_t n, int64_t block, size_t type_size) {
 }
 
 int tp_shard_plan_make(tp_shard_role role, int rank, int size,
-                       int64_t ne0_full, int64_t ne1_full,
+                       int64_t ne0_full, int64_t ne1_full, int64_t ne2_full,
                        int64_t block, size_t type_size,
                        tp_shard_plan * out) {
+    out->ne2 = ne2_full;   // unchanged except for EXPERT sharding
     if (size <= 1 || role == TP_SHARD_NONE) {
         out->ne0 = ne0_full; out->ne1 = ne1_full; out->nrows = ne1_full;
         out->chunk_bytes = row_bytes(ne0_full, block, type_size);
@@ -41,6 +44,21 @@ int tp_shard_plan_make(tp_shard_role role, int rank, int size,
         out->nrows = 1;
         out->chunk_bytes = (size_t)ne1_s * rb;
         out->base_off = (size_t)rank * ne1_s * rb;
+        out->src_stride = 0;
+        out->total_bytes = out->chunk_bytes;
+        return 0;
+    }
+
+    if (role == TP_SHARD_EXPERT) {
+        // split ne[2] (n_expert). Each expert is a contiguous ne0*ne1 block -> a single
+        // contiguous read of this rank's expert slice. Whole experts -> always block-safe.
+        if (ne2_full % size != 0) return -1;
+        int64_t ne2_s = ne2_full / size;
+        size_t  expert_bytes = (size_t)ne1_full * row_bytes(ne0_full, block, type_size);
+        out->ne0 = ne0_full; out->ne1 = ne1_full; out->ne2 = ne2_s;
+        out->nrows = 1;
+        out->chunk_bytes = (size_t)ne2_s * expert_bytes;
+        out->base_off = (size_t)rank * ne2_s * expert_bytes;
         out->src_stride = 0;
         out->total_bytes = out->chunk_bytes;
         return 0;

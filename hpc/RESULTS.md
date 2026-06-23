@@ -480,3 +480,17 @@ HW note: node 92 has TWO active EDR rails and ib0=172.16.0.92 is on the SAME sub
 3-physical-node test (121+124+92) is now possible (92 is CSL though; mixed-arch TP is correctness-OK,
 perf-limited by the slowest). Build gotcha: 92 has a SEPARATE /nix/store (not NFS-shared w/ 121);
 must `nix build nixpkgs#ucx ucx.dev` (or include in the nix shell) to realize UCX before building.
+
+## MoE EP debugging — mul_mat_id + sliced expert tensor is NOT buggy (2026-06-23)
+Suspected ggml_mul_mat_id gave wrong output for token>=1 when src0 is a sharded (ne[2]-sliced)
+expert tensor. Wrote a standalone repro (hpc/mul_mat_id_repro.c, no llama/TP code): build a full
+[K,N,256] expert tensor + a [K,N,128] slice of its first 128 experts, run mul_mat_id on both with
+identical src1 + ids (low experts), compare per token. RESULT: full == slice BIT-EXACT (maxdiff=0)
+for F32, Q8_0, Q4_K; for both the up/gate pattern (src1 ne1=1) AND the down pattern (src1 ne1=
+n_used); single- and multi-threaded. => slicing ne[2] is fully supported; NOT an upstream bug.
+The real MoE-EP multi-token bug (token>=1 wrong in prefill) is therefore in OUR integration
+(graph wiring / custom ops / scheduler interaction), NOT ggml. Every component verified correct in
+isolation (shard load per-rank base_off, sel_mm local ids, weight mask complementary, all-reduce
+combine mine+peer=sum, mul_mat_id) yet the composite fails — points to a subtle graph/scheduler
+issue. NEXT: pivot to a custom local-expert op (replaces remap+mask+3x mul_mat_id) which sidesteps
+the suspect chain and is the faster design anyway. Repro kept at hpc/mul_mat_id_repro.c.

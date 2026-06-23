@@ -35,6 +35,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-tp-shard.c
             llama-tp-net.c
+            llama-tp-moe.c
             llama-model.cpp
             llama-quant.cpp
             llama-sampler.cpp

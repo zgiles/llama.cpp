@@ -1,4 +1,6 @@
 #include "llama-graph.h"
+#include "llama-tp-moe.h"
+#include <cstdint>
 
 #include "llama-impl.h"
 #include "llama-tp-net.h"
@@ -1739,7 +1741,11 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     // CPU tensor parallelism: ffn_down is row-parallel (weight sharded on the contraction dim),
     // so each node holds a PARTIAL sum here. All-reduce across nodes to recover the full output.
-    if (down && llama_tp_enabled()) {
+    // NOTE: in MoE expert-parallel mode (LLAMA_TP_MOE) build_ffn is used only for the SHARED expert,
+    // whose ffn_down is REPLICATED (not sharded) — all-reducing it would multiply it by size. So
+    // suppress the dense-FFN all-reduce in MoE mode. (Assumes pure-MoE models have no sharded dense
+    // FFN layers, which holds for qwen35moe et al.; the MoE combine is all-reduced in build_moe_ffn.)
+    if (down && llama_tp_enabled() && !llama_tp_moe_enabled()) {
         cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
         cb(cur, "ffn_down_tp", il);
     }
@@ -1965,6 +1971,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    // CPU tensor parallelism — MoE expert parallelism: experts are sharded across ranks (each holds
+    // n_expert/size of them, a contiguous slice of the ffn_*_exps n_expert dim). The router is
+    // replicated, so every rank computes the same global top-k selection + weights. We remap the
+    // selected expert ids into this rank's LOCAL index space (non-local -> 0, masked out below) and
+    // zero the weights of non-local experts, then run the normal mul_mat_id FFN on the SHARDED expert
+    // tensors -> a PARTIAL moe_out; the per-rank partials all-reduce to the full output (below).
+    ggml_tensor * sel_mm = selected_experts;
+    const bool moe_solo = getenv("LLAMA_TP_MOE_SOLO") != nullptr;  // DEBUG: full experts, 1 proc
+    const bool moe_ep = (llama_tp_moe_enabled() || moe_solo) && gate_exps && down_exps && !gate_up_exps &&
+                        !weight_before_ffn && n_expert % (moe_solo ? 1 : llama_tp_size()) == 0;
+    if (moe_ep) {
+        const int     tp_n   = moe_solo ? 1 : llama_tp_size();
+        const int     tp_r   = moe_solo ? 0 : llama_tp_rank();
+        const int64_t e_cnt  = n_expert / tp_n;
+        const int64_t e_base = (int64_t) tp_r * e_cnt;
+        void * ud = (void *) (((uintptr_t) e_cnt << 32) | (uintptr_t) e_base);
+        // selected_experts is a strided VIEW (top-k of argsort: nb[1] = n_expert, not n_expert_used);
+        // our custom ops index it linearly, so make it contiguous first.
+        ggml_tensor * sel_c = ggml_cont(ctx0, selected_experts);
+        sel_mm  = ggml_map_custom1(ctx0, sel_c, tp_moe_local_ids_op,        1, ud);
+        weights = ggml_map_custom2(ctx0, weights, sel_c, tp_moe_mask_weights_op, 1, ud);
+        cb(weights, "ffn_moe_weights_masked", il);
+    }
+
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
@@ -1977,12 +2007,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, sel_mm, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2001,7 +2032,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, sel_mm, up_exps_s); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2014,7 +2045,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, sel_mm, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2103,7 +2134,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, sel_mm, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
@@ -2150,6 +2181,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    if (moe_ep) {
+        // combine each rank's partial moe_out into the full output
+        moe_out = ggml_map_custom1_inplace(ctx0, moe_out, llama_tp_allreduce_op, 1, nullptr);
+    }
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
