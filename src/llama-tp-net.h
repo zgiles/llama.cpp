@@ -18,6 +18,14 @@ int llama_tp_enabled(void);
 // so build_attn inserts an all-reduce after the row-parallel wo. Does NOT bootstrap the network.
 int llama_tp_attn_enabled(void);
 
+// Cheap env check (LLAMA_TP_SIZE > 1 && LLAMA_TP_MOE) — true when MoE experts are sharded across
+// ranks (expert parallelism) so build_moe_ffn remaps to local experts and all-reduces the combine.
+int llama_tp_moe_enabled(void);
+
+// This rank's id and the TP world size (from LLAMA_TP_RANK / LLAMA_TP_SIZE; 0 / 1 if unset).
+int llama_tp_rank(void);
+int llama_tp_size(void);
+
 // ggml custom1 op (n_tasks=1): in-place inter-node SUM all-reduce of `dst` (the partial
 // ffn_down output). On its first call (ggml thread 0) it lazily bootstraps the transport from
 // env (LLAMA_TP_SIZE / LLAMA_TP_RANK / LLAMA_TP_PEER / LLAMA_TP_PORT), so the UCX worker is

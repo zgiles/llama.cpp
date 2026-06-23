@@ -47,6 +47,7 @@ set(LLAMA_CORE_SOURCES
 set(LLAMA_TP_SOURCES
     llama-tp-shard.c
     llama-tp-net.c
+    llama-tp-moe.c
 )
 
 add_library(llama

@@ -1128,7 +1128,7 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 // split Q/KV heads), wo row-parallel (split the contraction == per-head input) + all-reduce.
 // Column-splitting wq/wk/wv reduces the local head counts; the loader compensates by dividing
 // hparams.n_head/n_head_kv so build_qkv, build_attn and the KV cache use per-rank head counts.
-static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn) {
+static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn, int moe) {
     switch (t) {
         case LLM_TENSOR_FFN_UP:
         case LLM_TENSOR_FFN_GATE:
@@ -1141,6 +1141,13 @@ static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn) {
             return attn ? TP_SHARD_COLUMN : TP_SHARD_NONE;
         case LLM_TENSOR_ATTN_OUT:
             return attn ? TP_SHARD_ROW : TP_SHARD_NONE;
+        // MoE expert parallelism: shard the routed expert tensors on the n_expert dim (ne[2]).
+        // gate_inp (router) stays replicated so every rank computes the same routing.
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:   // merged gate+up experts (qwen35moe et al.)
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+            return moe ? TP_SHARD_EXPERT : TP_SHARD_NONE;
         default:
             return TP_SHARD_NONE;
     }
@@ -1414,12 +1421,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // the load plan so load_data_for reads only the rank's slice from the GGUF.
     // (upstream reshapes into t_meta; shard the final allocated shape, not the raw cur.)
     struct ggml_tensor * tensor = nullptr;
-    tp_shard_role tp_role = tp_cfg.enabled ? tp_role_for_tensor(tn.tensor, tp_cfg.attn) : TP_SHARD_NONE;
+    tp_shard_role tp_role = tp_cfg.enabled ? tp_role_for_tensor(tn.tensor, tp_cfg.attn, tp_cfg.moe) : TP_SHARD_NONE;
     tp_shard_plan tp_plan;
     if (tp_role != TP_SHARD_NONE &&
-        tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, t_meta.ne[0], t_meta.ne[1],
+        tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, t_meta.ne[0], t_meta.ne[1], t_meta.ne[2],
                            ggml_blck_size(t_meta.type), ggml_type_size(t_meta.type), &tp_plan) == 0) {
-        int64_t sne[GGML_MAX_DIMS] = { tp_plan.ne0, tp_plan.ne1, t_meta.ne[2], t_meta.ne[3] };
+        int64_t sne[GGML_MAX_DIMS] = { tp_plan.ne0, tp_plan.ne1, tp_plan.ne2, t_meta.ne[3] };
         tensor = ggml_new_tensor(ctx, t_meta.type, ggml_n_dims(&t_meta), sne);
         ggml_set_name(tensor, ggml_get_name(&t_meta));
         tp_plans[ggml_get_name(&t_meta)] = tp_plan;
