@@ -462,3 +462,21 @@ comms is a smaller fraction there; low priority.)
 | 2 nodes rank=socket (4-way)           | 96          | 3.44       | 4.00x     | NUMA-local + 2nd node   |
 KEY: single-node 2.56x at the SAME 48 cores is pure NUMA locality (local vs UPI-striped weight reads).
 rank=socket is the dominant decode lever; comms (~18% at 4-way) is the residual skew-bound floor.
+
+## CROSS-ARCH: rank=socket NUMA-local win confirmed on Cascade Lake (2026-06-22/23)
+Built CSL-native (GGML_NATIVE -> -march=cascadelake, VNNI) on node 92 (tonto92, 8260, 2x24c HT-on,
+2x EDR rails mlx5_0/172.16.0.92 + mlx5_1/172.16.1.92). Single-node 2-socket TP via UCX sm only
+(localhost bootstrap PEER=127.0.0.1, UCX_TLS=sm,self -- no IB needed). 70B Q8_0, -mmp 0, -p128 -n64.
+
+| 70B Q8_0, single node       | single-proc 48t decode | 2-socket rank=socket decode | gain  |
+|-----------------------------|------------------------|-----------------------------|-------|
+| Skylake 8168 (no VNNI)      | 0.86                   | 2.20                        | 2.56x |
+| Cascade Lake 8260 (VNNI)    | 0.82                   | 2.03                        | 2.48x |
+The NUMA-local rank=socket decode win is ARCHITECTURAL (NUMA topology), ~2.5x on BOTH chips -- not a
+Skylake quirk. CSL slightly slower absolute (Q8 is BW-bound; 8260 lower clock/BW than 8168). CSL
+prefill ~flat 2-socket vs single (compute-bound, same 48 cores). CSL intra-node sm all-reduce ~130us
+(< Skylake 171us). VNNI doesn't show on Q8 (BW-bound) -- would matter on the Q4_K compute-bound path.
+HW note: node 92 has TWO active EDR rails and ib0=172.16.0.92 is on the SAME subnet as 121 -> a true
+3-physical-node test (121+124+92) is now possible (92 is CSL though; mixed-arch TP is correctness-OK,
+perf-limited by the slowest). Build gotcha: 92 has a SEPARATE /nix/store (not NFS-shared w/ 121);
+must `nix build nixpkgs#ucx ucx.dev` (or include in the nix shell) to realize UCX before building.
