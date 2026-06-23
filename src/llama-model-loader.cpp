@@ -1122,16 +1122,25 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
 }
 
 // Which weights are sharded for CPU tensor parallelism, and how.
-// Start with FFN-only (the simplest correct slice): ffn_up/gate column-parallel (split output
-// rows, no comm), ffn_down row-parallel (split the contraction -> needs an all-reduce in the
-// graph). Attention stays replicated for now.
-static tp_shard_role tp_role_for_tensor(llm_tensor t) {
+// FFN sharding (Phase 1): ffn_up/gate column-parallel (split output rows, no comm), ffn_down
+// row-parallel (split the contraction -> needs an all-reduce in the graph).
+// Attention sharding (Phase 2, when attn != 0): wq/wk/wv column-parallel (split output rows ==
+// split Q/KV heads), wo row-parallel (split the contraction == per-head input) + all-reduce.
+// Column-splitting wq/wk/wv reduces the local head counts; the loader compensates by dividing
+// hparams.n_head/n_head_kv so build_qkv, build_attn and the KV cache use per-rank head counts.
+static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn) {
     switch (t) {
         case LLM_TENSOR_FFN_UP:
         case LLM_TENSOR_FFN_GATE:
             return TP_SHARD_COLUMN;
         case LLM_TENSOR_FFN_DOWN:
             return TP_SHARD_ROW;
+        case LLM_TENSOR_ATTN_Q:
+        case LLM_TENSOR_ATTN_K:
+        case LLM_TENSOR_ATTN_V:
+            return attn ? TP_SHARD_COLUMN : TP_SHARD_NONE;
+        case LLM_TENSOR_ATTN_OUT:
+            return attn ? TP_SHARD_ROW : TP_SHARD_NONE;
         default:
             return TP_SHARD_NONE;
     }
@@ -1405,7 +1414,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // the load plan so load_data_for reads only the rank's slice from the GGUF.
     // (upstream reshapes into t_meta; shard the final allocated shape, not the raw cur.)
     struct ggml_tensor * tensor = nullptr;
-    tp_shard_role tp_role = tp_cfg.enabled ? tp_role_for_tensor(tn.tensor) : TP_SHARD_NONE;
+    tp_shard_role tp_role = tp_cfg.enabled ? tp_role_for_tensor(tn.tensor, tp_cfg.attn) : TP_SHARD_NONE;
     tp_shard_plan tp_plan;
     if (tp_role != TP_SHARD_NONE &&
         tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, t_meta.ne[0], t_meta.ne[1],

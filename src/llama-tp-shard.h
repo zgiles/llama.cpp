@@ -22,9 +22,11 @@ extern "C" {
 
 typedef enum { TP_SHARD_NONE = 0, TP_SHARD_COLUMN, TP_SHARD_ROW } tp_shard_role;
 
-typedef struct { int size; int rank; int enabled; } tp_shard_config;
+typedef struct { int size; int rank; int enabled; int attn; } tp_shard_config;
 
 // Reads LLAMA_TP_SIZE and LLAMA_TP_RANK from the environment. enabled = (size > 1).
+// attn = (enabled && LLAMA_TP_ATTN); when set, attention (wq/wk/wv/wo) is sharded too
+// (Phase 2). When unset, only the FFN is sharded (Phase 1, attention replicated).
 tp_shard_config tp_shard_from_env(void);
 
 // A load plan: `nrows` chunks of `chunk_bytes`, the i-th read from

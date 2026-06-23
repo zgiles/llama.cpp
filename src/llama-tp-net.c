@@ -6,6 +6,11 @@ int llama_tp_enabled(void) {
     return s && atoi(s) > 1;
 }
 
+int llama_tp_attn_enabled(void) {
+    const char * a = getenv("LLAMA_TP_ATTN");
+    return llama_tp_enabled() && a && atoi(a) != 0;
+}
+
 #ifdef LLAMA_TP_UCX
 
 #define _GNU_SOURCE
@@ -19,7 +24,7 @@ int llama_tp_enabled(void) {
 #include <netinet/in.h>
 
 #define TP_TAG 0x7A1C
-#define TP_TMP_FLOATS (1u << 20)   // 4 MB scratch (max all-reduce length)
+#define TP_TMP_FLOATS (4u << 20)   // 16 MB scratch (max all-reduce length = n_embd * n_tokens)
 
 struct tp_net {
     ucp_context_h ctx;
