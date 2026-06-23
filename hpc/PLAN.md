@@ -70,13 +70,14 @@ PURELY from NUMA-locality (same 96 total threads as 2-way; decode was UPI-bound)
 correct (3B). GOTCHA: pass -t 24 (= cores/socket) or you get 2x oversubscription. Comms now ~18% of
 decode (2 steps) -> Phase 3c (overlap) is the next lever. True N-physical-node awaits more IB hosts.
 
-## PHASE 3c — comms/compute overlap (NEXT; the measured top lever)
-- Decode comms is ~18% at 4-way and SYNC-bound (each rank spins for its peer). Comms-free ceiling
-  ~4.2 t/s. Overlap recovers it AND keeps comms from dominating toward the ~16-node barrier limit.
-- Split the all-reduce into LAUNCH (post sends/recvs, return) + WAIT (block before the consumer),
-  placing independent compute (next column-parallel matmul) between them. Needs UCX progressed OFF
-  the compute thread (dedicated progress thread) since single-thread mode + busy compute = no
-  progress. Careful ggml op ordering so the overlapped op has no data dep on the reduce result.
+## PHASE 3c — comms/compute overlap: INVESTIGATED, SHELVED for decode (2026-06-22). See RESULTS.md.
+Decode comms (~18% at 4-way) is a SKEW-BOUND hard sync point, NOT a hideable transfer. Proven:
+intra-node sm-only all-reduce is still ~170 us/call (~2 us wire) => it's arrival skew + progress
+spin, transport-independent; eager protocol didn't help. At batch=1 there is NO independent compute
+to overlap (tight residual dependency chain) and tiling makes skew-bound comms WORSE. A progress
+thread can't hide skew either. To reduce it you'd have to attack arrival skew (threadpool/OS jitter,
+NUMA contention) or change the comms structure — deep + uncertain. Overlap IS viable for prefill
+(tileable token dim) but low priority. Decode is good at 4.0x; moving on.
 
 ## PHASE 4 — Perf tuning
 - NUMA replication within node (the ~13% UPI penalty on Skylake; larger on bandwidth-bound

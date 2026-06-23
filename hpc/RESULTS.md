@@ -429,3 +429,36 @@ env `LLAMA_TP_SIZE=4 LLAMA_TP_RANK=$r LLAMA_TP_ATTN=1 LLAMA_TP_PEER=172.16.0.121
 `UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc,sm,self`. rank0 (coordinator) on 121/socket0.
 NOTE: this is 4 NUMA domains across 2 physical IB boxes (rank=socket), NOT 4 physical nodes — true
 N-physical-node scaling awaits more IB hosts (node 92 IB still down). The N-way transport is proven.
+
+## PHASE 3c — comms/compute overlap: INVESTIGATED, NOT VIABLE for decode (2026-06-22)
+Goal was to hide the ~18% decode comms behind compute. Conclusion after measurement: NOT possible at
+batch=1 decode; the comms is a SKEW-BOUND hard sync point, not a hideable transfer. Evidence:
+- Dependency chain per layer is tight: norm -> wq/wk/wv(no comm) -> attn -> wo -> AR#1 -> +residual
+  -> ffn_norm -> ffn_up/gate(no comm) -> ffn_down -> AR#2 -> +residual -> next layer. BOTH all-reduce
+  outputs feed the residual immediately; everything after depends on it. At 1 token there is no
+  sequence dimension to tile (the Megatron SP/overlap trick), so there is NO independent compute to
+  overlap the reduce with.
+- Force-eager (UCX_RNDV_THRESH=inf): 320 -> 295 us/call, decode unchanged (3.44->3.45). NOT rendezvous.
+- Single-node 2-socket, intra-node sm ONLY, NO IB, 1 step: all-reduce avg = 171 us/call for a ~2 us
+  shared-mem transfer. So ~170 us/step is pure ARRIVAL SKEW + progress spin, transport-independent:
+  the two ranks don't finish their 24-thread matmul at the same instant, so every barrier waits for
+  the laggard. (1 step intra ~170 us; 2-step intra+IB ~300 us => the rc step adds ~130 us.)
+- Three-way kill: (a) no independent compute to overlap (above); (b) a dedicated UCX progress thread
+  can't hide SKEW (the compute thread must still wait for the peer's data); (c) tiling the output to
+  pipeline reduces is COUNTERPRODUCTIVE when skew-bound -- more, smaller messages = more barriers =
+  more total skew.
+The ~18% decode comms is therefore a hard floor for this design. Reducing it would require attacking
+ARRIVAL SKEW itself (threadpool/OS jitter, NUMA contention between the 2 ranks sharing a node) -- a
+deep, uncertain effort -- or a fundamentally different comms structure. Decode overlap is shelved.
+(Overlap IS available for PREFILL -- 128 tokens are tileable -- but prefill is already ~33 t/s and
+comms is a smaller fraction there; low priority.)
+
+### Full decode picture (Llama-3.3-70B-Q8_0), the NUMA-locality story:
+| config                                | total cores | decode t/s | vs single | note                    |
+|---------------------------------------|-------------|------------|-----------|-------------------------|
+| single-node, 1 proc, 48t (UPI-striped)| 48          | 0.86       | 1.00x     | ~60 GB/s, 33% BW util   |
+| single-node, 2 sockets (sm, no IB)    | 48          | 2.20       | 2.56x     | NUMA-local, SAME cores  |
+| 2 nodes rank=node, 2x48t              | 96          | 1.32       | 1.53x     | UPI-striped per node    |
+| 2 nodes rank=socket (4-way)           | 96          | 3.44       | 4.00x     | NUMA-local + 2nd node   |
+KEY: single-node 2.56x at the SAME 48 cores is pure NUMA locality (local vs UPI-striped weight reads).
+rank=socket is the dominant decode lever; comms (~18% at 4-way) is the residual skew-bound floor.
