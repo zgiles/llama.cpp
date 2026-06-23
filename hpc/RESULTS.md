@@ -339,10 +339,93 @@ ANALYSIS:
 - Decode only +6.5% over Phase 1 (1.24->1.32), below what byte-count predicts (~1.9x ideal vs
   single). At batch=1 decode the FFN weight reads (already halved in Phase 1) dominate; attention
   is a smaller slice, and there's a fixed serial floor: the REPLICATED output projection (lm_head
-  [n_embd x 128k vocab], ~1.1 GB read + a 128k-wide matmul EVERY token) and tok_embd are not
-  sharded. Comms is NOT the limiter (160 reduces/token x ~12us = ~1.9 ms = ~0.25% of 758 ms/token).
+  [n_embd x 128k vocab], ~1.1 GB read + a 128k-wide matmul EVERY token) and tok_embd are not sharded.
+  (EARLIER CLAIM HERE — "comms is ~0.25%, not the limiter" — was WRONG; it used the standalone
+  microbench latency. The in-inference measurement below shows comms is ~5-10% and sync-bound.)
 - Prefill +12.6% (compute-bound regime benefits more from splitting attention flops).
 - Next levers for DECODE specifically: shard the output projection (column-parallel lm_head +
   all-gather logits), N>2 nodes (splits FFN further), comms/compute overlap. For MEMORY at scale:
   the KV-cache sharding already in place is the long-context win.
 Run recipe: identical to Phase 1 plus `LLAMA_TP_ATTN=1` in the env on BOTH ranks (port 13730 used).
+
+## IN-INFERENCE COMMS MEASUREMENT (2026-06-22) — comms is sync-bound, ~5-10% of decode at 2 nodes
+Instrumented the all-reduce op (LLAMA_TP_TIME: count + us/call, printed atexit) and added a comms-off
+timing mode (LLAMA_TP_NOCOMMS: skip the UCX exchange -> wrong output, pure-compute timing). 70B Q8_0,
+2-node, attn+FFN sharded, llama-bench -mmp 0 -p128 -n64 -r2:
+
+| run                  | decode tg64 | prefill pp128 | all-reduce avg/call | note                  |
+|----------------------|-------------|---------------|---------------------|-----------------------|
+| comms ON             | 1.24 ± 0.11 | 34.16         | ~400 us             | NOISY (sync jitter)   |
+| comms OFF (NOCOMMS)  | 1.38 ± 0.00 | 35.96         | 0.21 us (no-op)     | dead steady           |
+
+FINDINGS (these reshape the Phase 3 design):
+1. Comms costs ~5-10% of DECODE even at just 2 nodes (1.38 -> 1.24). NOT 0.25% — the microbench
+   was misleading. Direct A/B (comms on vs off) is the truth.
+2. It's SYNCHRONIZATION WAIT, not bandwidth: a 32 KB all-reduce takes ~400 us in situ vs ~12 us on
+   the wire (A2). Each node spins in ucp_worker_progress waiting for its PEER to reach the same
+   all-reduce point. The tell: comms-ON decode is noisy (+/-0.11), comms-OFF is +/-0.00 — the
+   jitter IS the cost. Even on identical, idle, balanced nodes the threadpools drift (OS noise,
+   progress granularity) and with NO overlap every drift becomes a stall.
+3. Scaling / the "~16-node limit" question, answered: the limiter as N grows is the BARRIER, not the
+   link. Recursive-doubling makes each all-reduce log2(N) sequential exchanges, each waiting on the
+   slowest of a growing group, while the compute it could overlap with SHRINKS as the FFN splits
+   further. Sync-bound barriers are why ~16 nodes is where comms tips over.
+
+DESIGN CONSEQUENCES:
+- COMMS/COMPUTE OVERLAP is promoted from "advanced/later" to a TOP lever. Launch the all-reduce
+  right after wo/ffn_down and only wait on it just before its result is consumed, so the next
+  column-parallel matmul (needs no comms) runs underneath it. Recovers most of the ~10% now and is
+  what keeps comms from dominating at scale. (Needs non-blocking UCX progressed off the compute
+  thread, or a deferred-wait op in the graph.)
+- rank=socket NUMA-local still matters independently: it lifts the COMPUTE ceiling (the 1.38).
+- Algorithm choice (recursive-doubling vs ring) matters LESS than minimizing barrier count + overlap.
+Instrumentation lives in src/llama-tp-net.c (g_time/g_nocomms, tp_print_stats); env LLAMA_TP_TIME=1,
+LLAMA_TP_NOCOMMS=1.
+
+## PHASE 3a+3b — N-way all-reduce + rank=socket (NUMA-local) — DONE + VALIDATED (2026-06-22)
+Generalized the 2-node exchange-sum to N-way (power-of-2) RECURSIVE-DOUBLING all-reduce over UCX
+(src/llama-tp-net.c rewrite): at step s a rank exchanges+sums with partner rank^(1<<s); after
+log2(N) steps all hold the global sum. Distinct tag per step (TP_TAG+s) so a fast rank's step-(s+1)
+message can't be grabbed by a slow rank's step-s recv. Bootstrap: rank 0 is a TCP coordinator on the
+IB subnet that gathers every rank's UCX worker address and broadcasts the full list; each rank then
+opens eps to its log2(N) partners. Rank LAYOUT is chosen by the launcher so step 0 pairs are
+INTRA-node (UCX auto-selects sm) and later steps inter-node (rc) -> hierarchy for free, no special-
+casing in code. Requires size power-of-2 in [2,16].
+
+rank=SOCKET: run ONE process per socket (numactl --cpunodebind=N --membind=N -t 24) so each shard's
+weights are NUMA-LOCAL. On the 2-node pair this is a 4-way TP (rank0=121/s0 [coordinator],
+rank1=121/s1, rank2=124/s0, rank3=124/s1), all LLAMA_TP_SIZE=4 LLAMA_TP_PEER=172.16.0.121.
+
+CORRECTNESS (3B, llama-simple): 4-way output TOKEN-FOR-TOKEN identical to single-node. Log:
+"attention sharded — local n_head=6 n_head_kv=2 (tp_size=4)" (24/4, 8/4), "transport up (rank 0/4,
+2 steps)". All 4 ranks ran exactly 21120 all-reduces (lockstep).
+
+PERF (Llama-3.3-70B-Q8_0, llama-bench -mmp 0 -p128 -n64 -r2):
+
+| config                              | decode tg64 | prefill pp128 | RSS/rank | total threads |
+|-------------------------------------|-------------|---------------|----------|---------------|
+| single-node                         | 0.86        | 19.22         | 71.7 GB  | 48            |
+| 2-way rank=node                     | 1.32        | 34.83         | 37.0 GB  | 2x48 = 96     |
+| 4-way rank=socket, -t 48 (BAD)      | 2.94        | 26.63         | 19.7 GB  | 4x48 = 192 (oversub) |
+| **4-way rank=socket, -t 24**        | **3.44**    | **33.35**     | 19.7 GB  | 4x24 = 96     |
+
+*** HEADLINE: rank=socket decode = 3.44 t/s = 4.0x single-node, 2.6x over 2-way rank=node. ***
+THE KEY INSIGHT: 2-way (2x48) and 4-way (4x24) use the SAME 96 total threads — so the 2.6x decode
+gain is PURELY NUMA-LOCALITY, not more cores. Confirms decode was UPI/NUMA-bound: a single 48-thread
+process strdes weights across both NUMA nodes (~60 GB/s, 33% util, A1); rank=socket reads each 1/4
+shard from LOCAL memory at full per-socket BW. This is the decode lever we'd been missing.
+- GOTCHA: numactl restricts the cpuset but llama-bench's default -t still saw 48 -> 2 ranks/node x 48
+  = 2x OVERSUBSCRIPTION, which clobbered compute-bound prefill (34.8->26.6) and capped decode (2.94).
+  Setting -t 24 (= cores per socket) fixed BOTH: decode 2.94->3.44, prefill 26.6->33.4. ALWAYS pass
+  -t = cores-per-socket for rank=socket.
+- Memory: 19.7 GB/RANK (1/4 model + replicated embed/output), ~39 GB/node (replicated parts now 2x
+  per node). Per-node ~unchanged vs 2-way; the win here is DECODE SPEED + the path to scale.
+- Comms grew to ~18% of decode at 4-way (2 recursive-doubling steps + faster/smaller compute to hide
+  it behind). avg all-reduce ~320 us/call (step0 sm + step1 rc). Comms-free ceiling ~4.2 t/s ->
+  comms/compute OVERLAP (Phase 3c) is the clear next lever, and is what keeps comms from dominating
+  as N grows toward the ~16-node barrier limit.
+Run recipe: per-rank `numactl --cpunodebind=$SOCK --membind=$SOCK llama-bench ... -t 24 -mmp 0`,
+env `LLAMA_TP_SIZE=4 LLAMA_TP_RANK=$r LLAMA_TP_ATTN=1 LLAMA_TP_PEER=172.16.0.121 LLAMA_TP_PORT=P`,
+`UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc,sm,self`. rank0 (coordinator) on 121/socket0.
+NOTE: this is 4 NUMA domains across 2 physical IB boxes (rank=socket), NOT 4 physical nodes — true
+N-physical-node scaling awaits more IB hosts (node 92 IB still down). The N-way transport is proven.

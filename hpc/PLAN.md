@@ -60,13 +60,23 @@ modest because the FFN (already halved in P1) dominates batch=1 decode and the R
 Files: llama-tp-shard.{c,h}, llama-model-loader.cpp, llama-tp-net.{c,h}, llama-graph.cpp, llama.cpp.
 NEXT-decode levers identified: shard lm_head (column + all-gather), N>2 nodes, comms/compute overlap.
 
-## PHASE 3 — N>2 nodes (recursive-doubling all-reduce)
-- src/llama-tp-net.c is currently a 2-node exchange-sum. Generalize to N:
-  recursive-doubling (log2 N steps, power-of-2) or ring-allreduce. Need N-1 endpoints +
-  a bootstrap rendezvous (rank 0 coordinator, or all-pairs TCP address exchange).
-- Sharding math already general (divides by tp_size). Only the transport + bootstrap change.
-- Validate 4-node coherence; measure all-reduce latency vs node count (compare to A2 prediction:
-  log2(N) hops; SHARP would flatten it).
+## PHASE 3a+3b — N-way all-reduce + rank=socket — DONE + VALIDATED (2026-06-22). See RESULTS.md.
+N-way recursive-doubling all-reduce over UCX (rank^(1<<s) partners, log2 N steps, per-step tag) +
+rank-0 TCP coordinator bootstrap (gather/broadcast worker addrs). Power-of-2 size in [2,16]. Rank
+layout makes step0 intra-node (sm) and later steps inter-node (rc) -> free hierarchy.
+rank=SOCKET (numactl --cpunodebind/--membind, -t = cores/socket) makes each shard NUMA-LOCAL.
+*** 4-way rank=socket (2 nodes x 2 sockets): decode 3.44 t/s = 4.0x single-node, 2.6x over 2-way ***
+PURELY from NUMA-locality (same 96 total threads as 2-way; decode was UPI-bound). Token-for-token
+correct (3B). GOTCHA: pass -t 24 (= cores/socket) or you get 2x oversubscription. Comms now ~18% of
+decode (2 steps) -> Phase 3c (overlap) is the next lever. True N-physical-node awaits more IB hosts.
+
+## PHASE 3c — comms/compute overlap (NEXT; the measured top lever)
+- Decode comms is ~18% at 4-way and SYNC-bound (each rank spins for its peer). Comms-free ceiling
+  ~4.2 t/s. Overlap recovers it AND keeps comms from dominating toward the ~16-node barrier limit.
+- Split the all-reduce into LAUNCH (post sends/recvs, return) + WAIT (block before the consumer),
+  placing independent compute (next column-parallel matmul) between them. Needs UCX progressed OFF
+  the compute thread (dedicated progress thread) since single-thread mode + busy compute = no
+  progress. Careful ggml op ordering so the overlapped op has no data dep on the reduce result.
 
 ## PHASE 4 — Perf tuning
 - NUMA replication within node (the ~13% UPI penalty on Skylake; larger on bandwidth-bound
