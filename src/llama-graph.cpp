@@ -2702,6 +2702,15 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
+    // CPU tensor parallelism (Phase 2): wo is row-parallel (sharded on the contraction == the
+    // per-head attention output), so each node holds a PARTIAL sum here. All-reduce across nodes
+    // to recover the full attention output. Must run BEFORE wo_b so the (replicated) bias is added
+    // once, not summed across ranks.
+    if (wo && llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "attn_out_tp", il);
+    }
+
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }

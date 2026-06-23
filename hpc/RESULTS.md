@@ -256,3 +256,93 @@ Run: rank1/server on 124 (LLAMA_TP_RANK=1 LLAMA_TP_PORT=P), rank0/client on 121 
 Remaining (future): attention sharding (wq/wk/wv col + wo row+all-reduce, more comm), N>2 nodes
 (recursive-doubling), NUMA replication within node, comms/compute overlap, perf tuning on large
 models (3B is too small to show TP speedup -- it was for correctness).
+
+## PHASE 1 — Large-model perf baseline (DONE 2026-06-22): 70B Q8_0, FFN-sharded 2-node TP
+Model: Llama-3.3-70B-Instruct-ablated-Q8_0 (split GGUF, point at -00001; 69.82 GiB, 70.55B).
+Nodes: Skylake 8168 pair 121+124, 48 threads/node, EDR IB. llama-bench -p128 -n64.
+**The split GGUF + TP-shard combination WORKS** (was previously untested; only the single-file
+3B had been validated). Both ranks bootstrapped transport, ran in lockstep (identical t/s),
+tp_dbg confirmed complementary partials (mine != peer) -> all-reduce sums real halves.
+
+| config                        | decode tg64 t/s | prefill pp128 t/s | peak RSS / node |
+|-------------------------------|-----------------|-------------------|-----------------|
+| single-node (mmap=0, 48t)     | 0.86 ± 0.00     | 19.22 ± 0.22      | 71.7 GB         |
+| 2-node TP FFN-sharded (mmap=0)| 1.24 ± 0.00     | 30.93 ± 0.80      | 43.2 GB         |
+| **speedup / ratio**           | **1.44x**       | **1.61x**         | **0.60 (-40%)** |
+
+MEASUREMENT GOTCHA: the first single-node run used default mmap=1 and gave NOISY garbage
+(tg64 0.40 ± 0.12, pp128 11.89 ± 3.15) -- mmap-over-NFS page-faults the 70 GB during the timed
+runs. Re-run with `-mmp 0` (NOT `--no-mmap`, which llama-bench doesn't accept) -> fully resident,
+rock-steady. ALWAYS bench CPU with mmap=0 when the model is on NFS. Decode 0.86 t/s = ~60 GB/s
+effective (consistent with A1's Q4_K_M 70B scaled to Q8's 70 GB/token read).
+
+ANALYSIS (the Phase-1 decision point):
+- Memory: measured 0.60x/node EXACTLY matches theory. FFN ~80% of params; halving it ->
+  per-node = 0.2 (attn/embed, replicated) + 0.8/2 (FFN) = 0.60 of full. -40% RAM/node confirmed.
+- Decode 1.44x vs ideal 1.67x (= 1/0.60). The ~0.23 gap is NOT comms: at hidden=8192 the
+  all-reduce is ~32 KB, 2 reduces x 80 layers ~= <2 ms/token, i.e. <0.3% of the 806 ms/token.
+  The gap is the REPLICATED ATTENTION (full attn compute on BOTH nodes, zero parallelism there)
+  plus barrier/sync. Attention is now the dominant non-parallelized cost.
+- prefill 1.61x is closer to ideal (compute-bound regime, FFN dominates the matmul flops more).
+- DECISION: attention sharding (Phase 2) is the clear next lever -- it both removes the
+  replicated-attention ceiling (pushes decode toward and past 1.67x via head-parallel attn) AND
+  shards the KV cache for per-node KV-memory savings at long context. Phase 1 confirms it's worth
+  the work. N>2 nodes (Phase 3) then multiplies the FFN win further.
+Run recipe used: rank1/server on 124 first (`LLAMA_TP_SIZE=2 LLAMA_TP_RANK=1 LLAMA_TP_PORT=13710`),
+then rank0/client on 121 (`... RANK=0 LLAMA_TP_PEER=172.16.0.124 LLAMA_TP_PORT=13710`), both
+`UCX_NET_DEVICES=mlx5_0:1 UCX_TLS=rc,sm,self`, llama-bench `-mmp 0 -t 48 -p 128 -n 64 -r 2`.
+
+## PHASE 2 — Attention sharding DONE + VALIDATED (2026-06-22)
+Implemented head-parallel attention TP, gated behind a new `LLAMA_TP_ATTN=1` env flag (FFN-only
+Phase-1 mode stays the default when unset). Design:
+- wq/wk/wv COLUMN-sharded (split ne[1] = output rows = Q/KV heads); wo ROW-sharded (split ne[0]
+  = the per-head contraction) + an all-reduce after the wo matmul (mirrors ffn_down). 2 all-
+  reduces/layer now instead of 1.
+- THE key subtlety (per the plan): local head counts. Solved with ONE lever — after load_tensors,
+  divide hparams.n_head_arr / n_head_kv_arr by tp_size (llama.cpp ~line 333). Because n_embd_head_k
+  is stored independently and n_embd_k_gqa = n_embd_head_k * n_head_kv, this automatically (a)
+  shrinks the KV cache to local KV heads and (b) feeds local head counts to build_qkv / build_attn,
+  while n_embd (residual stream) stays full. build_attn_mha is already head-count-agnostic (derives
+  dims from tensor ne). Tensors are created/sharded against the FULL GGUF dims FIRST (file dim check
+  passes), THEN the arrays are reduced — order matters.
+- GQA stays correct per-rank: contiguous equal splits of both Q heads and KV heads map rank r's
+  local Q heads exactly onto its local KV heads (proof: q head h -> kv head floor(h/g); rank r's
+  q range [r*Hq/s,(r+1)*Hq/s) maps to kv range [r*Hkv/s,(r+1)*Hkv/s) when s | Hq and s | Hkv).
+- Guards: refuse (clear error) if any layer's n_head/n_head_kv isn't divisible by tp_size, or if
+  the model uses fused QKV / attention bias (column-splitting a 1-D bias is unsupported for now;
+  Llama has neither). Also bumped the all-reduce scratch 1M->4M floats so larger prefill batches
+  don't abort.
+Files: src/llama-tp-shard.{c,h} (attn flag), src/llama-model-loader.cpp (tp_role_for_tensor:
+ATTN_Q/K/V->COLUMN, ATTN_OUT->ROW), src/llama-tp-net.{c,h} (llama_tp_attn_enabled), src/llama-
+graph.cpp (all-reduce after wo), src/llama.cpp (head-count reduction + guards).
+
+CORRECTNESS (Llama-3.2-3B-Q6_K, llama-simple -n 32 "The capital of France is"):
+  attn+FFN sharded 2-node output == single-node output TOKEN-FOR-TOKEN (exact, not just coherent):
+  "...Paris. ...located in the Île-de-France region. ...also the most populous city in France."
+  Log confirmed "attention sharded — local n_head=12 n_head_kv=4 (tp_size=2)" (24->12, 8->4).
+
+PERF (Llama-3.3-70B-Q8_0, 2 nodes, llama-bench -mmp 0 -p128 -n64 -r2, LLAMA_TP_ATTN=1):
+
+| config                          | decode tg64 | prefill pp128 | peak RSS / node |
+|---------------------------------|-------------|---------------|-----------------|
+| single-node                     | 0.86        | 19.22         | 71.7 GB         |
+| Phase 1: FFN-only TP            | 1.24        | 30.93         | 43.2 GB         |
+| **Phase 2: FFN + attn TP**      | **1.32**    | **34.83**     | **37.0 GB**     |
+| Phase 2 vs single-node          | 1.53x       | 1.81x         | 0.52 (-48%)     |
+| Phase 2 vs Phase 1              | +6.5%       | +12.6%        | -14%            |
+
+ANALYSIS:
+- Memory: -6.2 GB/node vs Phase 1, matches theory (attention ~13 GB total, halved -> ~6.5 GB/node).
+  Now 0.52x single-node RAM. NOTE: this short-context bench barely exercises the KV cache, so the
+  RSS drop is almost all ATTENTION WEIGHTS, not KV. The KV-cache halving (the other half of the
+  win) shows up at LONG context — that's where Phase 2 pays off most (per-node KV memory).
+- Decode only +6.5% over Phase 1 (1.24->1.32), below what byte-count predicts (~1.9x ideal vs
+  single). At batch=1 decode the FFN weight reads (already halved in Phase 1) dominate; attention
+  is a smaller slice, and there's a fixed serial floor: the REPLICATED output projection (lm_head
+  [n_embd x 128k vocab], ~1.1 GB read + a 128k-wide matmul EVERY token) and tok_embd are not
+  sharded. Comms is NOT the limiter (160 reduces/token x ~12us = ~1.9 ms = ~0.25% of 758 ms/token).
+- Prefill +12.6% (compute-bound regime benefits more from splitting attention flops).
+- Next levers for DECODE specifically: shard the output projection (column-parallel lm_head +
+  all-gather logits), N>2 nodes (splits FFN further), comms/compute overlap. For MEMORY at scale:
+  the KV-cache sharding already in place is the long-context win.
+Run recipe: identical to Phase 1 plus `LLAMA_TP_ATTN=1` in the env on BOTH ranks (port 13730 used).

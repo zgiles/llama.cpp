@@ -37,29 +37,28 @@ Run 2-node (rank1=server on 124, rank0=client on 121), both with
 ALWAYS kill stray procs after runs: `pgrep -x llama-simple|llama-bench|... | xargs -r kill -9`.
 Local repo changes are UNCOMMITTED (working tree) — consider committing before big changes.
 
-## PHASE 1 — Large-model perf baseline (DO FIRST; no new code)
-The 3B was correctness-only. Run a real model big enough that compute/memory dominate.
-- Dense 70B from /kimie: Llama-3.3-70B-Instruct-ablated-Q8_0 (split 00001/00002) or
-  DeepSeek-R1-Distill-Llama-70B-Q8_0. Single-node (non-TP, mmap) decode t/s + RSS  vs
-  2-node TP (--no-mmap) decode t/s + per-node RSS.
-- Expectation: FFN-only halves FFN compute+memory/node; attention replicated. Modest decode
-  speedup, ~halved FFN memory/node. Also measures all-reduce cost at hidden=8192 activations.
-- Gotcha: split GGUF — point at the 00001 file; both parts must be on /kimie (they are).
-- Decision: this tells us how much attention sharding matters before investing in it.
+## PHASE 1 — Large-model perf baseline — DONE (2026-06-22). See RESULTS.md "PHASE 1" section.
+Llama-3.3-70B-Q8_0 (69.82 GiB), Skylake pair, llama-bench -p128 -n64 -mmp 0:
+  single-node decode 0.86 t/s / RSS 71.7 GB  vs  2-node TP decode 1.24 t/s / RSS 43.2 GB/node.
+  => decode 1.44x, prefill 1.61x, RAM/node -40% (0.60x, exactly matches FFN=80% halved theory).
+Split GGUF + TP-shard combo VALIDATED (point at -00001). Comms is <0.3% of decode; the 1.44x-vs-
+ideal-1.67x gap is REPLICATED ATTENTION, not the network.
+GOTCHA: bench with `-mmp 0` (not `--no-mmap`); mmap-over-NFS made the first run noisy garbage.
+DECISION: attention is now the dominant non-parallelized cost -> Phase 2 (attention sharding) is
+the clear next lever. PROCEED to Phase 2.
 
-## PHASE 2 — Attention sharding (biggest remaining compute + KV-memory win)
-- tp_role_for_tensor (llama-model-loader.cpp): add ATTN_Q/K/V -> COLUMN, ATTN_OUT -> ROW.
-- HARD subtlety: heads. Column-split wq/wk/wv = split heads -> each rank gets n_head/tp query
-  heads, n_head_kv/tp KV heads (GQA). The graph (build_attn, llama-graph.cpp ~2226) reshapes
-  Q/K/V using hparams.n_head / n_head_kv and allocates the KV cache with n_head_kv. With sharded
-  weights those counts must be the LOCAL (per-rank) values. Investigate whether build_attn /
-  KV-cache derive head counts from the tensor ne or from hparams; likely need a per-rank
-  "local n_head/n_head_kv" override (in hparams or a TP context) threaded through build_attn
-  and the KV cache. This is the real work of this phase.
-- RoPE is per-head (fine on local heads). wo = ROW-parallel + all-reduce (reuse the ffn_down op).
-- KV cache becomes sharded -> per-node KV memory win (good for long context).
-- Require n_head and n_head_kv divisible by tp_size; refuse/fall back otherwise.
-- Validate: coherent token-for-token vs single-node.
+## PHASE 2 — Attention sharding — DONE + VALIDATED (2026-06-22). See RESULTS.md "PHASE 2".
+Head-parallel attention TP, gated by `LLAMA_TP_ATTN=1` (FFN-only stays default). wq/wk/wv COLUMN,
+wo ROW + all-reduce. SOLVED the local-head-count subtlety with ONE lever: after load_tensors,
+divide hparams.n_head_arr / n_head_kv_arr by tp_size (n_embd_head_k is stored independently, so the
+KV cache, build_qkv and build_attn all pick up local head counts automatically; n_embd stays full).
+build_attn_mha is already head-agnostic. Guards: divisibility + refuse fused-QKV / attn-bias.
+VALIDATED token-for-token vs single-node (3B). 70B 2-node: decode 1.32 t/s (1.53x single, +6.5% vs
+Phase 1), prefill 34.83 (1.81x), RSS 37.0 GB/node (0.52x single, -14% vs Phase 1). Decode gain is
+modest because the FFN (already halved in P1) dominates batch=1 decode and the REPLICATED lm_head
+(128k-vocab matmul/token) is a fixed floor; KV-cache halving is the long-context memory win.
+Files: llama-tp-shard.{c,h}, llama-model-loader.cpp, llama-tp-net.{c,h}, llama-graph.cpp, llama.cpp.
+NEXT-decode levers identified: shard lm_head (column + all-gather), N>2 nodes, comms/compute overlap.
 
 ## PHASE 3 — N>2 nodes (recursive-doubling all-reduce)
 - src/llama-tp-net.c is currently a 2-node exchange-sum. Generalize to N:

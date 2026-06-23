@@ -331,6 +331,40 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
+        // CPU tensor parallelism (Phase 2): when attention is sharded (LLAMA_TP_ATTN), wq/wk/wv
+        // were column-split at load so this rank holds only n_head/tp query heads and n_head_kv/tp
+        // KV heads. Divide the per-layer head counts now (AFTER the tensors were created against the
+        // full GGUF dims) so build_qkv, build_attn and the KV cache all use this rank's LOCAL head
+        // counts. n_embd (the residual stream) and n_embd_head are unchanged.
+        {
+            const tp_shard_config tp = tp_shard_from_env();
+            if (tp.attn) {
+                auto & hp = model->hparams;
+                const uint32_t nl = hp.n_layer();
+                for (uint32_t il = 0; il < nl; ++il) {
+                    if (hp.n_head_arr[il] % tp.size != 0 || hp.n_head_kv_arr[il] % tp.size != 0) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: layer %u n_head=%u n_head_kv=%u not divisible "
+                            "by tp_size=%d — refusing to shard attention\n",
+                            __func__, il, hp.n_head_arr[il], hp.n_head_kv_arr[il], tp.size);
+                        return {-2, nullptr};
+                    }
+                }
+                for (const auto & layer : model->layers) {
+                    if (layer.wqkv || layer.wq_b || layer.wk_b || layer.wv_b) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: model uses fused QKV or attention bias, "
+                            "which attention sharding does not support yet\n", __func__);
+                        return {-2, nullptr};
+                    }
+                }
+                for (uint32_t il = 0; il < nl; ++il) {
+                    hp.n_head_arr[il]    /= tp.size;
+                    hp.n_head_kv_arr[il] /= tp.size;
+                }
+                LLAMA_LOG_INFO("%s: tensor parallelism: attention sharded — local n_head=%u "
+                    "n_head_kv=%u (tp_size=%d)\n", __func__, hp.n_head_arr[0], hp.n_head_kv_arr[0], tp.size);
+            }
+        }
+
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());

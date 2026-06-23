@@ -14,6 +14,10 @@ extern "C" {
 // all-reduce op. Does NOT bootstrap the network.
 int llama_tp_enabled(void);
 
+// Cheap env check (LLAMA_TP_SIZE > 1 && LLAMA_TP_ATTN) — true when attention is sharded (Phase 2)
+// so build_attn inserts an all-reduce after the row-parallel wo. Does NOT bootstrap the network.
+int llama_tp_attn_enabled(void);
+
 // ggml custom1 op (n_tasks=1): in-place inter-node SUM all-reduce of `dst` (the partial
 // ffn_down output). On its first call (ggml thread 0) it lazily bootstraps the transport from
 // env (LLAMA_TP_SIZE / LLAMA_TP_RANK / LLAMA_TP_PEER / LLAMA_TP_PORT), so the UCX worker is
