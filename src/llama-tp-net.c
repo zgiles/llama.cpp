@@ -11,6 +11,21 @@ int llama_tp_attn_enabled(void) {
     return llama_tp_enabled() && a && atoi(a) != 0;
 }
 
+int llama_tp_moe_enabled(void) {
+    const char * m = getenv("LLAMA_TP_MOE");
+    return llama_tp_enabled() && m && atoi(m) != 0;
+}
+
+int llama_tp_rank(void) {
+    const char * r = getenv("LLAMA_TP_RANK");
+    return r ? atoi(r) : 0;
+}
+
+int llama_tp_size(void) {
+    const char * s = getenv("LLAMA_TP_SIZE");
+    return s ? atoi(s) : 1;
+}
+
 #ifdef LLAMA_TP_UCX
 
 #define _GNU_SOURCE
