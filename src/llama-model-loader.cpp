@@ -1096,6 +1096,27 @@ static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn, tp_moe_mode moe_
     }
 }
 
+// Read this rank's shard of a tensor from the GGUF. A strided plan (nrows>1: tensor-parallel
+// gate/up/down, one chunk per output row/expert) would otherwise do one read per chunk — millions of
+// tiny, seek-heavy reads on a large model, pathological over a network filesystem. Instead read the
+// enclosing span ONCE, sequentially, and extract the chunks in RAM. Contiguous plans (nrows==1:
+// column / expert-parallel) and naturally-contiguous strides stay a single read.
+static void tp_read_shard(llama_file * file, size_t offs, const tp_shard_plan & pl, uint8_t * dst) {
+    if (pl.nrows <= 1 || pl.src_stride == pl.chunk_bytes) {
+        const size_t n = (pl.nrows <= 1) ? pl.chunk_bytes : (size_t) pl.nrows * pl.chunk_bytes;
+        file->seek(offs + pl.base_off, SEEK_SET);
+        file->read_raw(dst, n);
+        return;
+    }
+    const size_t span = (size_t) (pl.nrows - 1) * pl.src_stride + pl.chunk_bytes;
+    std::vector<uint8_t> buf(span);
+    file->seek(offs + pl.base_off, SEEK_SET);
+    file->read_raw(buf.data(), span);
+    for (int64_t r = 0; r < pl.nrows; r++) {
+        memcpy(dst + (size_t) r * pl.chunk_bytes, buf.data() + (size_t) r * pl.src_stride, pl.chunk_bytes);
+    }
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1473,10 +1494,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
         uint8_t * dst = (uint8_t *) cur->data;
         GGML_ASSERT(w.idx < files.size());
         const auto & file = files.at(w.idx);
-        for (int64_t r = 0; r < pl.nrows; r++) {
-            file->seek(w.offs + pl.base_off + (size_t) r * pl.src_stride, SEEK_SET);
-            file->read_raw(dst + (size_t) r * pl.chunk_bytes, pl.chunk_bytes);
-        }
+        tp_read_shard(file.get(), w.offs, pl, dst);
         if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, ggml_nbytes(cur))) {
             throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
         }
@@ -1669,11 +1687,7 @@ bool llama_model_loader::load_all_data(
                 auto tp_it = tp_plans.find(ggml_get_name(cur));
                 if (tp_it != tp_plans.end()) {
                     const tp_shard_plan & pl = tp_it->second;
-                    uint8_t * dst = (uint8_t *) cur->data;
-                    for (int64_t r = 0; r < pl.nrows; r++) {
-                        file->seek(weight->offs + pl.base_off + (size_t) r * pl.src_stride, SEEK_SET);
-                        file->read_raw(dst + (size_t) r * pl.chunk_bytes, pl.chunk_bytes);
-                    }
+                    tp_read_shard(file.get(), weight->offs, pl, (uint8_t *) cur->data);
                 } else {
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(cur->data, n_size);
