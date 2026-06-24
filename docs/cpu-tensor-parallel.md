@@ -143,32 +143,32 @@ cmake --build build -j --target llama-cli llama-bench
 
 ## Running
 
-Tensor parallelism is configured entirely through environment variables; launch one process per rank.
+Launch one process per rank, each pinned to its NUMA domain. Tensor parallelism is configured with the
+options below (CLI flags, which also accept the matching `LLAMA_ARG_*` environment variables):
 
-| Variable | Meaning |
-|---|---|
-| `LLAMA_TP_SIZE` | number of ranks (power of two) |
-| `LLAMA_TP_RANK` | this process's rank id (`0 … size-1`); rank 0 is the rendezvous |
-| `LLAMA_TP_PEER` | rank 0's address (TCP rendezvous); the same value on every non-zero rank |
-| `LLAMA_TP_PORT` | rendezvous port |
-| `LLAMA_TP_MOE` | `ep`, `tp`, or unset/`off` (MoE parallel mode) |
-| `LLAMA_TP_ATTN` | `1` to also shard attention (heads) |
-| `UCX_TLS`, `UCX_NET_DEVICES` | UCX transport selection (`sm` intra-node, `rc` + device for IB) |
+| CLI flag | `llama_model_params` field | Meaning |
+|---|---|---|
+| `--tp-size N` | `tp_size` | number of ranks (power of two; 1 = disabled) |
+| `--tp-rank N` | `tp_rank` | this process's rank (`0 … size-1`); rank 0 is the rendezvous |
+| `--moe-parallel {none,expert,tensor}` | `moe_parallel` | MoE parallel mode (see above) |
+| `--tp-attn` | `tp_attn` | also shard attention (heads) |
+| `--tp-peer ADDR` | `tp_peer` | rank 0's address (TCP rendezvous), set on every non-zero rank |
+| `--tp-port PORT` | `tp_port` | rendezvous port |
+| `UCX_TLS`, `UCX_NET_DEVICES` | — | UCX transport (`sm` intra-node, `rc` + device for IB) |
 
-Each rank must be pinned to its NUMA domain and given that domain's core count.
+The transport (`UCX_*`) is selected with UCX's own environment variables. For backward compatibility the
+legacy `LLAMA_TP_SIZE` / `LLAMA_TP_RANK` / `LLAMA_TP_MOE` / `LLAMA_TP_ATTN` / `LLAMA_TP_PEER` / `LLAMA_TP_PORT`
+variables are still honored when the corresponding option is left at its default.
 
 ### One node, two sockets (no InfiniBand)
 
 ```bash
 M=model.gguf
+ARGS="-m $M --tp-size 2 --moe-parallel tensor --tp-port 13900 -t 24 -p ..."
 # rank 0 — socket 0
-UCX_TLS=sm,self LLAMA_TP_SIZE=2 LLAMA_TP_RANK=0 LLAMA_TP_MOE=tp \
-  LLAMA_TP_PEER=127.0.0.1 LLAMA_TP_PORT=13900 \
-  numactl --cpunodebind=0 --membind=0 ./llama-cli -m $M -t 24 -p "..." &
+UCX_TLS=sm,self numactl --cpunodebind=0 --membind=0 ./llama-cli $ARGS --tp-rank 0 &
 # rank 1 — socket 1
-UCX_TLS=sm,self LLAMA_TP_SIZE=2 LLAMA_TP_RANK=1 LLAMA_TP_MOE=tp \
-  LLAMA_TP_PEER=127.0.0.1 LLAMA_TP_PORT=13900 \
-  numactl --cpunodebind=1 --membind=1 ./llama-cli -m $M -t 24 -p "..." &
+UCX_TLS=sm,self numactl --cpunodebind=1 --membind=1 ./llama-cli $ARGS --tp-rank 1 &
 wait
 ```
 
@@ -178,15 +178,15 @@ Rank 0 listens; non-zero ranks connect to rank 0's address. The bootstrap can us
 (e.g. ethernet); the data path uses the IB device named in `UCX_NET_DEVICES`.
 
 ```bash
-# nodeA: ranks 0,1   nodeB: ranks 2,3   (PEER = nodeA's address)
-COMMON="UCX_TLS=rc,sm,self UCX_NET_DEVICES=mlx5_0:1 LLAMA_TP_SIZE=4 LLAMA_TP_MOE=tp \
-  LLAMA_TP_PEER=10.0.0.1 LLAMA_TP_PORT=13900"
+# nodeA: ranks 0,1   nodeB: ranks 2,3   (--tp-peer = nodeA's address)
+export UCX_TLS=rc,sm,self UCX_NET_DEVICES=mlx5_0:1
+A="-m $M --tp-size 4 --moe-parallel tensor --tp-peer 10.0.0.1 --tp-port 13900 -t 24"
 # on nodeA:
-env $COMMON LLAMA_TP_RANK=0 numactl --cpunodebind=0 --membind=0 ./llama-cli -m $M -t 24 ... &
-env $COMMON LLAMA_TP_RANK=1 numactl --cpunodebind=1 --membind=1 ./llama-cli -m $M -t 24 ... &
+numactl --cpunodebind=0 --membind=0 ./llama-cli $A --tp-rank 0 &
+numactl --cpunodebind=1 --membind=1 ./llama-cli $A --tp-rank 1 &
 # on nodeB:
-env $COMMON LLAMA_TP_RANK=2 numactl --cpunodebind=0 --membind=0 ./llama-cli -m $M -t 24 ... &
-env $COMMON LLAMA_TP_RANK=3 numactl --cpunodebind=1 --membind=1 ./llama-cli -m $M -t 24 ... &
+numactl --cpunodebind=0 --membind=0 ./llama-cli $A --tp-rank 2 &
+numactl --cpunodebind=1 --membind=1 ./llama-cli $A --tp-rank 3 &
 ```
 
 For the recursive-doubling all-reduce to keep its first step intra-node, place consecutive ranks on the

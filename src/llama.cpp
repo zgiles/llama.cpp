@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
+#include "llama-tp-net.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
 
@@ -397,6 +398,11 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
     ggml_time_init();
+
+    // CPU tensor parallelism: publish the requested config so the loader, graph builder and all-reduce
+    // use it. When left at defaults (tp_size <= 1) the accessors fall back to the LLAMA_TP_* env vars.
+    llama_tp_set_config(params.tp_size, params.tp_rank, (int) params.moe_parallel,
+                        params.tp_attn ? 1 : 0, params.tp_peer, params.tp_port);
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
