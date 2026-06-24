@@ -126,6 +126,21 @@ of every selected expert; the partials are all-reduced. No index remap is needed
 | Medium | DeepSeek-V3 | 256 × 2048 | `tp` (≤8-way) or `ep` (capacity) |
 | Fine-grained (many tiny experts) | Qwen3 A3B | 256 × 512 | `ep` (capacity); `tp` only 2-way |
 
+The difference, for a MoE layer with the selected experts laid out as `[n_ff × n_expert_used]` per token:
+
+```
+        EXPERT parallel (ep)                    TENSOR parallel (tp)
+   split the expert SET across ranks       split each expert's n_ff across ranks
+
+      experts ─────────────►                    experts ─────────────►
+   n_ff │ r0 r0 │ r1 r1 │ r2 r2 │            n_ff │ r0 r0 r0 r0 r0 r0 │
+        │ r0 r0 │ r1 r1 │ r2 r2 │                 │ r1 r1 r1 r1 r1 r1 │
+        ▼ r0 r0 │ r1 r1 │ r2 r2 │                 ▼ r2 r2 r2 r2 r2 r2 │
+   each rank owns whole experts             every rank owns an n_ff slice of every expert
+   (routing decides which are used →        (balanced; splits compute even at batch=1;
+    imbalanced; scales to many ranks)         capped by n_ff / quant-block size)
+```
+
 ## Building
 
 Build with the native CPU backend and point the build at a UCX install (the inter-node transport is
@@ -191,6 +206,34 @@ numactl --cpunodebind=1 --membind=1 ./llama-cli $A --tp-rank 3 &
 
 For the recursive-doubling all-reduce to keep its first step intra-node, place consecutive ranks on the
 same node (ranks 0,1 on nodeA; 2,3 on nodeB).
+
+### SLURM batch job
+
+One task per rank (= per socket). SLURM sets `SLURM_PROCID` (global rank) and `SLURM_LOCALID` (the task's
+index on its node, which maps to the socket); rank 0's node is the bootstrap peer.
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=llama-tp
+#SBATCH --nodes=2            # nodes
+#SBATCH --ntasks-per-node=2  # ranks per node (one per socket)
+#SBATCH --cpus-per-task=24   # cores per socket
+#SBATCH --exclusive
+
+MODEL=/path/to/model.gguf
+PEER=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+export UCX_TLS=rc,sm,self UCX_NET_DEVICES=mlx5_0:1
+
+# one process per rank; bind each to its socket for NUMA-local weights
+srun --cpu-bind=none bash -c "
+  numactl --cpunodebind=\$SLURM_LOCALID --membind=\$SLURM_LOCALID \
+    ./llama-cli -m $MODEL \
+      --tp-size \$SLURM_NTASKS --tp-rank \$SLURM_PROCID \
+      --tp-peer $PEER --tp-port 13900 \
+      --moe-parallel tensor --no-mmap -t \$SLURM_CPUS_PER_TASK \
+      -p 'The capital of France is'
+"
+```
 
 > [!TIP]
 > Use `-t <cores-per-socket>` (not the whole machine) on each rank, and load with `--no-mmap` (sharded
