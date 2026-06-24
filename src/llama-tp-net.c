@@ -2,20 +2,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-int llama_tp_enabled(void) {
+// Process-wide CPU-TP config, set once from llama_model_params at model-load time
+// (llama_tp_set_config). Left at defaults (size <= 1), the accessors fall back to the legacy
+// LLAMA_TP_* environment variables so existing env-driven launches keep working. moe_mode uses the
+// same 0/1/2 encoding as llama_moe_parallel_mode / tp_moe_mode. peer/port feed the all-reduce bootstrap.
+static struct { int size, rank, moe_mode, attn, port; const char * peer; } g_tp = { 1, 0, 0, 0, 0, NULL };
+static char g_tp_peer[256];
+
+void llama_tp_set_config(int size, int rank, int moe_mode, int attn, const char * peer, int port) {
+    g_tp.size = size; g_tp.rank = rank; g_tp.moe_mode = moe_mode;
+    g_tp.attn = attn; g_tp.port = port;
+    // copy peer: it is consumed at inference time (the lazy all-reduce bootstrap), after the caller's
+    // llama_model_params may be gone.
+    if (peer && peer[0]) {
+        strncpy(g_tp_peer, peer, sizeof(g_tp_peer) - 1);
+        g_tp_peer[sizeof(g_tp_peer) - 1] = '\0';
+        g_tp.peer = g_tp_peer;
+    } else {
+        g_tp.peer = NULL;
+    }
+}
+
+// the API config takes precedence once it actually requests TP (size > 1); otherwise read the env.
+static int tp_cfg_active(void) { return g_tp.size > 1; }
+
+int llama_tp_size(void) {
+    if (tp_cfg_active()) return g_tp.size;
     const char * s = getenv("LLAMA_TP_SIZE");
-    return s && atoi(s) > 1;
+    return s ? atoi(s) : 1;
+}
+
+int llama_tp_rank(void) {
+    if (tp_cfg_active()) return g_tp.rank;
+    const char * r = getenv("LLAMA_TP_RANK");
+    return r ? atoi(r) : 0;
+}
+
+int llama_tp_enabled(void) {
+    return llama_tp_size() > 1;
 }
 
 int llama_tp_attn_enabled(void) {
+    if (!llama_tp_enabled()) return 0;
+    if (tp_cfg_active()) return g_tp.attn != 0;
     const char * a = getenv("LLAMA_TP_ATTN");
-    return llama_tp_enabled() && a && atoi(a) != 0;
+    return a && atoi(a) != 0;
 }
 
 // MoE-parallel mode (matches tp_moe_mode): 0=off, 1=expert-parallel, 2=tensor-parallel(experts).
-// LLAMA_TP_MOE = "tp"/"tensor" -> 2, "ep"/"expert"/"1" -> 1 (back-compat), else -> 0.
+// env LLAMA_TP_MOE = "tp"/"tensor" -> 2, "ep"/"expert"/"1" -> 1 (back-compat), else -> 0.
 int llama_tp_moe_mode(void) {
     if (!llama_tp_enabled()) return 0;
+    if (tp_cfg_active()) return g_tp.moe_mode;
     const char * m = getenv("LLAMA_TP_MOE");
     if (!m) return 0;
     if (strcmp(m, "tp") == 0 || strcmp(m, "tensor") == 0) return 2;
@@ -27,14 +65,15 @@ int llama_tp_moe_enabled(void) {
     return llama_tp_moe_mode() != 0;
 }
 
-int llama_tp_rank(void) {
-    const char * r = getenv("LLAMA_TP_RANK");
-    return r ? atoi(r) : 0;
+const char * llama_tp_peer(void) {
+    if (tp_cfg_active() && g_tp.peer) return g_tp.peer;
+    return getenv("LLAMA_TP_PEER");
 }
 
-int llama_tp_size(void) {
-    const char * s = getenv("LLAMA_TP_SIZE");
-    return s ? atoi(s) : 1;
+int llama_tp_port(void) {
+    if (tp_cfg_active() && g_tp.port > 0) return g_tp.port;
+    const char * p = getenv("LLAMA_TP_PORT");
+    return p ? atoi(p) : 13700;
 }
 
 #ifdef LLAMA_TP_UCX
@@ -217,12 +256,8 @@ void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * 
         g_time    = getenv("LLAMA_TP_TIME")    && atoi(getenv("LLAMA_TP_TIME"))    != 0;
         g_nocomms = getenv("LLAMA_TP_NOCOMMS") && atoi(getenv("LLAMA_TP_NOCOMMS")) != 0;
         if (g_time) atexit(tp_print_stats);
-        const char * sz = getenv("LLAMA_TP_SIZE");
-        if (sz && atoi(sz) > 1) {
-            int size = atoi(sz);
-            int rank = getenv("LLAMA_TP_RANK") ? atoi(getenv("LLAMA_TP_RANK")) : 0;
-            int port = getenv("LLAMA_TP_PORT") ? atoi(getenv("LLAMA_TP_PORT")) : 13700;
-            g_net = tp_net_init(rank, size, getenv("LLAMA_TP_PEER"), port);
+        if (llama_tp_size() > 1) {  // config (llama_model_params) or LLAMA_TP_* env fallback
+            g_net = tp_net_init(llama_tp_rank(), llama_tp_size(), llama_tp_peer(), llama_tp_port());
         }
     }
     if (!g_net) return;

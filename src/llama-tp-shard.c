@@ -1,30 +1,16 @@
 #include "llama-tp-shard.h"
-#include <stdlib.h>
-#include <string.h>
+#include "llama-tp-net.h"
 
+// Read the effective TP config: the values set from llama_model_params (llama_tp_set_config), or the
+// legacy LLAMA_TP_* environment fallback — both resolved by the llama-tp-net accessors.
 tp_shard_config tp_shard_from_env(void) {
-    tp_shard_config c = {1, 0, 0, 0, 0, TP_MOE_OFF};
-    const char * s = getenv("LLAMA_TP_SIZE");
-    const char * r = getenv("LLAMA_TP_RANK");
-    const char * a = getenv("LLAMA_TP_ATTN");
-    const char * m = getenv("LLAMA_TP_MOE");
-    if (s) c.size = atoi(s);
-    if (r) c.rank = atoi(r);
-    if (c.size < 1) c.size = 1;
-    if (c.rank < 0 || c.rank >= c.size) c.rank = 0;
-    c.enabled = (c.size > 1);
-    c.attn = (c.enabled && a && atoi(a) != 0);
-    // LLAMA_TP_MOE selects the MoE-parallel mode: "tp"/"tensor" -> tensor-parallel experts,
-    // "ep"/"expert"/"1" -> expert-parallel (back-compat), anything else / unset -> off.
-    c.moe_mode = TP_MOE_OFF;
-    if (c.enabled && m) {
-        if (strcmp(m, "tp") == 0 || strcmp(m, "tensor") == 0) {
-            c.moe_mode = TP_MOE_TENSOR;
-        } else if (strcmp(m, "ep") == 0 || strcmp(m, "expert") == 0 || atoi(m) != 0) {
-            c.moe_mode = TP_MOE_EXPERT;
-        }
-    }
-    c.moe = (c.moe_mode != TP_MOE_OFF);
+    tp_shard_config c;
+    c.size     = llama_tp_size();
+    c.rank     = llama_tp_rank();
+    c.enabled  = llama_tp_enabled();
+    c.attn     = llama_tp_attn_enabled();
+    c.moe_mode = (tp_moe_mode) llama_tp_moe_mode();
+    c.moe      = (c.moe_mode != TP_MOE_OFF);
     return c;
 }
 

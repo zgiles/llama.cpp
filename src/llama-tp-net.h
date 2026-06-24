@@ -26,9 +26,17 @@ int llama_tp_moe_enabled(void);
 // parallel (split each expert's n_ff like a dense FFN). Mirrors tp_moe_mode in llama-tp-shard.h.
 int llama_tp_moe_mode(void);
 
-// This rank's id and the TP world size (from LLAMA_TP_RANK / LLAMA_TP_SIZE; 0 / 1 if unset).
+// This rank's id and the TP world size (from the config, else LLAMA_TP_RANK / LLAMA_TP_SIZE).
 int llama_tp_rank(void);
 int llama_tp_size(void);
+
+// Set the process-wide TP config from llama_model_params at model-load time. moe_mode uses the
+// 0/1/2 encoding (off/expert/tensor). When size <= 1, the accessors fall back to LLAMA_TP_* env.
+void llama_tp_set_config(int size, int rank, int moe_mode, int attn, const char * peer, int port);
+
+// rank-0 bootstrap address / port for the all-reduce transport (config, else LLAMA_TP_PEER/PORT env).
+const char * llama_tp_peer(void);
+int          llama_tp_port(void);
 
 // ggml custom1 op (n_tasks=1): in-place inter-node SUM all-reduce of `dst` (the partial
 // ffn_down output). On its first call (ggml thread 0) it lazily bootstraps the transport from
