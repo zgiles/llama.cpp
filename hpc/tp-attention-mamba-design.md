@@ -30,7 +30,22 @@ sharded.
 * **Effort:** small (reuses dense FFN sharding). **Payoff:** modest but free — the shexp runs on every
   token; on DeepSeek it is `n_ff_exp × n_expert_shared` wide.
 
-## 2. MLA attention (DeepSeek) — MODERATE, high value
+## 2. MLA attention (DeepSeek) — DONE (2026-06-24), MODERATE, high value
+
+> **Status: implemented + validated correct** on DeepSeek-V3.1-Q4 (2-rank, single node). Coherent output,
+> log line `attention sharded (MLA) — local n_head=64 n_head_kv=1 (tp_size=2)`. Enable with
+> `LLAMA_TP_ATTN=1` (alongside `LLAMA_TP_MOE=tp`). The crucial fact confirmed at load: DeepSeek MLA reports
+> **`n_head_kv == 1`** (the absorbed-MQA latent), so only the **query heads** are sharded (`n_head` divided);
+> `n_head_kv` and the latent KV cache are left exactly as single-node (replicated on every rank). Roles:
+> `wq_b` COLUMN, `wk_b`/`wv_b` per-head `ne[2]=n_head` (EXPERT-style) split, `wo` ROW + all-reduce (added to
+> the `attn_k` overload); `wq_a`/`wkv_a_mqa`/`*_a_norm` replicated. The plan below is what was built.
+>
+> **Perf (DeepSeek-V3.1-Q4, 2-rank single-node, `-p128 -n32 -t24 -mmp0`):** tensor-only `pp 15.31 / tg 3.25`
+> → tensor+MLA-attn `pp 19.16 / tg 3.68` = **+25% prefill, +13% decode**, on top of tensor-mode MoE. Unlike
+> the shared-expert experiment (§1, net loss because it is too small), MLA attention is a large enough
+> replicated component that head-splitting it pays off.
+
+
 
 MLA factors Q and KV through low-rank latents: `wq_a→q_a_norm→wq_b`, `wkv_a_mqa→kv_a_norm→wk_b/wv_b`, then
 `wo`. The heads (`n_head`) still exist; the per-head tensors are `wq_b {q_lora, n_head·head_k}`,

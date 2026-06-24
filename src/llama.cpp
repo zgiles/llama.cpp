@@ -342,8 +342,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             if (tp.attn) {
                 auto & hp = model->hparams;
                 const uint32_t nl = hp.n_layer();
+                // MLA (DeepSeek) shards only the query heads; its single shared latent KV head
+                // (n_head_kv == 1, the compressed cache) stays replicated on every rank.
+                const bool is_mla = hp.is_mla();
                 for (uint32_t il = 0; il < nl; ++il) {
-                    if (hp.n_head_arr[il] % tp.size != 0 || hp.n_head_kv_arr[il] % tp.size != 0) {
+                    const bool kv_ok = is_mla || hp.n_head_kv_arr[il] % tp.size == 0;
+                    if (hp.n_head_arr[il] % tp.size != 0 || !kv_ok) {
                         LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: layer %u n_head=%u n_head_kv=%u not divisible "
                             "by tp_size=%d — refusing to shard attention\n",
                             __func__, il, hp.n_head_arr[il], hp.n_head_kv_arr[il], tp.size);
@@ -351,18 +355,29 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     }
                 }
                 for (const auto & layer : model->layers) {
-                    if (layer.wqkv || layer.wq_b || layer.wk_b || layer.wv_b) {
-                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: model uses fused QKV or attention bias, "
+                    if (layer.wqkv) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: model uses fused QKV, "
                             "which attention sharding does not support yet\n", __func__);
+                        return {-2, nullptr};
+                    }
+                    // wq_b/wk_b/wv_b are the MLA per-head latent projections. They are sharded for
+                    // MLA models; on a non-MLA model they would be the legacy unabsorbed path we
+                    // do not handle, so refuse there.
+                    if (!is_mla && (layer.wq_b || layer.wk_b || layer.wv_b)) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: model uses low-rank attention without MLA "
+                            "absorption, which attention sharding does not support yet\n", __func__);
                         return {-2, nullptr};
                     }
                 }
                 for (uint32_t il = 0; il < nl; ++il) {
-                    hp.n_head_arr[il]    /= tp.size;
-                    hp.n_head_kv_arr[il] /= tp.size;
+                    hp.n_head_arr[il] /= tp.size;
+                    if (!is_mla) {
+                        hp.n_head_kv_arr[il] /= tp.size;
+                    }
                 }
-                LLAMA_LOG_INFO("%s: tensor parallelism: attention sharded — local n_head=%u "
-                    "n_head_kv=%u (tp_size=%d)\n", __func__, hp.n_head_arr[0], hp.n_head_kv_arr[0], tp.size);
+                LLAMA_LOG_INFO("%s: tensor parallelism: attention sharded%s — local n_head=%u "
+                    "n_head_kv=%u (tp_size=%d)\n", __func__, is_mla ? " (MLA)" : "",
+                    hp.n_head_arr[0], hp.n_head_kv_arr[0], tp.size);
             }
         }
 

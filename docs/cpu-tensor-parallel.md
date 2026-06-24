@@ -87,6 +87,7 @@ Rank 0 acts as a TCP rendezvous point for exchanging UCX addresses at startup (`
 |---|---|---|
 | Dense FFN (`ffn_gate`/`ffn_up` column-parallel, `ffn_down` row-parallel) | always (when TP enabled) | intermediate dim `n_ff` |
 | Attention (`wq`/`wk`/`wv` column, `wo` row) | `LLAMA_TP_ATTN=1` | heads |
+| MLA attention (DeepSeek: `wq_b` column, `wk_b`/`wv_b` per-head, `wo` row) | `LLAMA_TP_ATTN=1` | query heads |
 | MoE routed experts | `LLAMA_TP_MOE=ep\|tp` | see [MoE parallel modes](#moe-parallel-modes) |
 
 The MoE router (`gate_inp`), shared expert, embeddings, and (unless `LLAMA_TP_ATTN=1`) attention are
@@ -292,7 +293,9 @@ Takeaways:
 * `LLAMA_TP_SIZE` must be a power of two (recursive-doubling all-reduce).
 * Tensor mode (`tp`) is bounded by `n_ff` / quant block alignment (see [MoE parallel modes](#moe-parallel-modes)).
 * Requires `-DGGML_CPU_REPACK=OFF` and `--no-mmap`.
-* Attention sharding (`LLAMA_TP_ATTN=1`) requires separate Q/K/V tensors (not a fused QKV).
+* Attention sharding (`LLAMA_TP_ATTN=1`) requires separate Q/K/V tensors (not a fused QKV). MLA
+  models (DeepSeek) are supported: only the query heads are sharded — the single compressed latent
+  KV head (`n_head_kv == 1`) and its cache stay replicated on every rank.
 * **Hybrid models** (e.g. Mamba/SSM + MoE such as `nemotron_h_moe`) only have their MoE-FFN layers
   sharded; the SSM and attention layers are replicated on every rank. TP runs correctly but only pays off
   if the MoE-FFN is the bottleneck — for SSM/attention-dominated hybrids those layers must also be sharded.

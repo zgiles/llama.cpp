@@ -1078,6 +1078,14 @@ static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn, tp_moe_mode moe_
             return attn ? TP_SHARD_COLUMN : TP_SHARD_NONE;
         case LLM_TENSOR_ATTN_OUT:
             return attn ? TP_SHARD_ROW : TP_SHARD_NONE;
+        // MLA (DeepSeek) per-query-head latent projections. The shared latent compressions
+        // (attn_q_a, attn_kv_a_mqa, *_a_norm) stay REPLICATED. wq_b output is n_head*head_k -> COLUMN;
+        // wk_b/wv_b are per-head 3D [.., .., n_head] -> slice the head dim (EXPERT-style ne[2] split).
+        case LLM_TENSOR_ATTN_Q_B:
+            return attn ? TP_SHARD_COLUMN : TP_SHARD_NONE;
+        case LLM_TENSOR_ATTN_K_B:
+        case LLM_TENSOR_ATTN_V_B:
+            return attn ? TP_SHARD_EXPERT : TP_SHARD_NONE;
         // MoE routed experts. gate_inp (router) stays replicated so every rank routes identically.
         //   EXPERT mode: shard the n_expert dim (ne[2]) — each rank owns whole experts.
         //   TENSOR mode: shard each expert's intermediate n_ff like a dense FFN — gate/up COLUMN

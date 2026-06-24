@@ -2838,6 +2838,14 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
+    // CPU tensor parallelism: with MLA head-sharding, wo is row-parallel (this rank holds a partial
+    // sum over its query heads) — all-reduce to recover the full attention output. Before wo_b so the
+    // replicated bias is added once.
+    if (wo && llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "attn_out_tp", il);
+    }
+
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
