@@ -1689,6 +1689,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.tp_size         = params.tp_size;
+    mparams.tp_rank         = params.tp_rank;
+    mparams.tp_port         = params.tp_port;
+    mparams.tp_attn         = params.tp_attn;
+    mparams.tp_peer         = params.tp_peer.empty() ? nullptr : params.tp_peer.c_str();
+    mparams.moe_parallel    = params.moe_parallel;
+    // NOTE: upstream's load_mode refactor replaced mparams.use_mmap/use_direct_io/use_mlock
+    // (now set via mparams.load_mode above), so those fork assignments are intentionally dropped.
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

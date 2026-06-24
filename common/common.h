@@ -485,6 +485,15 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    // CPU tensor parallelism (EXPERIMENTAL): shard a model across CPU ranks (processes), one per
+    // NUMA domain and/or node, combining partial results with an all-reduce. See --tp-* in arg.cpp.
+    int32_t     tp_size = 1;     // number of tensor-parallel ranks (1 = disabled)
+    int32_t     tp_rank = 0;     // this process's rank, in [0, tp_size)
+    int32_t     tp_port = 0;     // inter-rank bootstrap TCP port (0 = default)
+    bool        tp_attn = false; // also shard attention (heads) across ranks
+    std::string tp_peer;         // rank-0 bootstrap address (empty = 127.0.0.1)
+    enum llama_moe_parallel_mode moe_parallel = LLAMA_MOE_PARALLEL_NONE; // how to parallelize MoE experts
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
