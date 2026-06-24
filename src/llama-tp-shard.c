@@ -1,8 +1,9 @@
 #include "llama-tp-shard.h"
 #include <stdlib.h>
+#include <string.h>
 
 tp_shard_config tp_shard_from_env(void) {
-    tp_shard_config c = {1, 0, 0, 0, 0};
+    tp_shard_config c = {1, 0, 0, 0, 0, TP_MOE_OFF};
     const char * s = getenv("LLAMA_TP_SIZE");
     const char * r = getenv("LLAMA_TP_RANK");
     const char * a = getenv("LLAMA_TP_ATTN");
@@ -13,7 +14,17 @@ tp_shard_config tp_shard_from_env(void) {
     if (c.rank < 0 || c.rank >= c.size) c.rank = 0;
     c.enabled = (c.size > 1);
     c.attn = (c.enabled && a && atoi(a) != 0);
-    c.moe  = (c.enabled && m && atoi(m) != 0);
+    // LLAMA_TP_MOE selects the MoE-parallel mode: "tp"/"tensor" -> tensor-parallel experts,
+    // "ep"/"expert"/"1" -> expert-parallel (back-compat), anything else / unset -> off.
+    c.moe_mode = TP_MOE_OFF;
+    if (c.enabled && m) {
+        if (strcmp(m, "tp") == 0 || strcmp(m, "tensor") == 0) {
+            c.moe_mode = TP_MOE_TENSOR;
+        } else if (strcmp(m, "ep") == 0 || strcmp(m, "expert") == 0 || atoi(m) != 0) {
+            c.moe_mode = TP_MOE_EXPERT;
+        }
+    }
+    c.moe = (c.moe_mode != TP_MOE_OFF);
     return c;
 }
 
@@ -36,16 +47,18 @@ int tp_shard_plan_make(tp_shard_role role, int rank, int size,
     }
 
     if (role == TP_SHARD_COLUMN) {
-        // split ne[1] (output rows). Whole rows -> always block-safe. Single contiguous read.
+        // split ne[1] (output rows). Whole rows -> always block-safe. For a 2D weight this is one
+        // contiguous read; for a 3D expert tensor (ne2 experts) it's one chunk per expert (each
+        // expert keeps its full ne0, this rank's ne1 slice), read strided across experts.
         if (ne1_full % size != 0) return -1;
         int64_t ne1_s = ne1_full / size;
         size_t  rb    = row_bytes(ne0_full, block, type_size);
         out->ne0 = ne0_full; out->ne1 = ne1_s;
-        out->nrows = 1;
+        out->nrows = ne2_full;                       // 1 for 2D weights
         out->chunk_bytes = (size_t)ne1_s * rb;
         out->base_off = (size_t)rank * ne1_s * rb;
-        out->src_stride = 0;
-        out->total_bytes = out->chunk_bytes;
+        out->src_stride = (size_t)ne1_full * rb;     // full expert size (unused when nrows==1)
+        out->total_bytes = (size_t)ne2_full * out->chunk_bytes;
         return 0;
     }
 
@@ -64,16 +77,18 @@ int tp_shard_plan_make(tp_shard_role role, int rank, int size,
         return 0;
     }
 
-    // TP_SHARD_ROW: split ne[0] (the contraction). Must be block-aligned per shard.
+    // TP_SHARD_ROW: split ne[0] (the contraction). Must be block-aligned per shard. One strided
+    // chunk per output row; for a 3D expert tensor that's ne1*ne2 rows (experts are contiguous in
+    // memory, so iterating rows across all experts with the full-row stride covers them all).
     if (ne0_full % (size * block) != 0) return -1;   // would cut a quant block -> corruption
     int64_t ne0_s = ne0_full / size;
     size_t  full_rb  = row_bytes(ne0_full, block, type_size);
     size_t  shard_rb = row_bytes(ne0_s,    block, type_size);
     out->ne0 = ne0_s; out->ne1 = ne1_full;
-    out->nrows = ne1_full;                 // one strided chunk per output row
+    out->nrows = ne1_full * ne2_full;      // one strided chunk per (output row, expert)
     out->chunk_bytes = shard_rb;
     out->base_off = (size_t)rank * shard_rb;
     out->src_stride = full_rb;
-    out->total_bytes = (size_t)ne1_full * shard_rb;
+    out->total_bytes = (size_t)out->nrows * shard_rb;
     return 0;
 }

@@ -18,9 +18,13 @@ int llama_tp_enabled(void);
 // so build_attn inserts an all-reduce after the row-parallel wo. Does NOT bootstrap the network.
 int llama_tp_attn_enabled(void);
 
-// Cheap env check (LLAMA_TP_SIZE > 1 && LLAMA_TP_MOE) — true when MoE experts are sharded across
-// ranks (expert parallelism) so build_moe_ffn remaps to local experts and all-reduces the combine.
+// Cheap env check — true when MoE experts are sharded across ranks (any mode) so build_moe_ffn
+// shards the expert FFN and all-reduces the combine.
 int llama_tp_moe_enabled(void);
+
+// MoE-parallel mode: 0=off, 1=expert-parallel (sharded expert set, dynamic routing), 2=tensor-
+// parallel (split each expert's n_ff like a dense FFN). Mirrors tp_moe_mode in llama-tp-shard.h.
+int llama_tp_moe_mode(void);
 
 // This rank's id and the TP world size (from LLAMA_TP_RANK / LLAMA_TP_SIZE; 0 / 1 if unset).
 int llama_tp_rank(void);

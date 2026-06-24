@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-tp-moe.h"
+#include "llama-tp-shard.h"
 #include <cstdint>
 
 #include "llama-impl.h"
@@ -1971,17 +1972,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    // CPU tensor parallelism — MoE expert parallelism: experts are sharded across ranks (each holds
-    // n_expert/size of them, a contiguous slice of the ffn_*_exps n_expert dim). The router is
-    // replicated, so every rank computes the same global top-k selection + weights. We remap the
-    // selected expert ids into this rank's LOCAL index space (non-local -> 0, masked out below) and
-    // zero the weights of non-local experts, then run the normal mul_mat_id FFN on the SHARDED expert
-    // tensors -> a PARTIAL moe_out; the per-rank partials all-reduce to the full output (below).
+    // CPU tensor parallelism — MoE parallelism (selectable mode). Either way the per-rank expert FFN
+    // produces a PARTIAL moe_out that we all-reduce to the full output (below); the router stays
+    // replicated so every rank routes identically.
+    //   EXPERT mode: the loader sharded the expert SET (each rank owns n_expert/size experts). We
+    //     remap the selected ids into this rank's local index space and zero non-local weights, so
+    //     the normal mul_mat_id computes only the locally-owned selected experts.
+    //   TENSOR mode: the loader split each expert's n_ff (gate/up COLUMN, down ROW). NO remap needed —
+    //     the normal mul_mat_id path computes this rank's n_ff slice of EVERY selected expert.
     ggml_tensor * sel_mm = selected_experts;
-    const bool moe_solo = getenv("LLAMA_TP_MOE_SOLO") != nullptr;  // DEBUG: full experts, 1 proc
-    const bool moe_ep = (llama_tp_moe_enabled() || moe_solo) && gate_exps && down_exps && !gate_up_exps &&
-                        !weight_before_ffn && n_expert % (moe_solo ? 1 : llama_tp_size()) == 0;
-    if (moe_ep) {
+    const bool moe_solo = getenv("LLAMA_TP_MOE_SOLO") != nullptr;  // DEBUG: EP path, 1 proc, full experts
+    const int  moe_mode = moe_solo ? TP_MOE_EXPERT : llama_tp_moe_mode();
+    const bool moe_par  = (moe_mode != TP_MOE_OFF) && gate_exps && down_exps && !gate_up_exps && !weight_before_ffn;
+    if (moe_par && moe_mode == TP_MOE_EXPERT) {
         const int     tp_n   = moe_solo ? 1 : llama_tp_size();
         const int     tp_r   = moe_solo ? 0 : llama_tp_rank();
         const int64_t e_cnt  = n_expert / tp_n;
@@ -2181,7 +2184,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
-    if (moe_ep) {
+    if (moe_par) {
         // combine each rank's partial moe_out into the full output
         moe_out = ggml_map_custom1_inplace(ctx0, moe_out, llama_tp_allreduce_op, 1, nullptr);
     }
