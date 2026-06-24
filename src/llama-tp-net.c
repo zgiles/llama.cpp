@@ -1,5 +1,6 @@
 #include "llama-tp-net.h"
 #include <stdlib.h>
+#include <string.h>
 
 int llama_tp_enabled(void) {
     const char * s = getenv("LLAMA_TP_SIZE");
@@ -11,9 +12,19 @@ int llama_tp_attn_enabled(void) {
     return llama_tp_enabled() && a && atoi(a) != 0;
 }
 
-int llama_tp_moe_enabled(void) {
+// MoE-parallel mode (matches tp_moe_mode): 0=off, 1=expert-parallel, 2=tensor-parallel(experts).
+// LLAMA_TP_MOE = "tp"/"tensor" -> 2, "ep"/"expert"/"1" -> 1 (back-compat), else -> 0.
+int llama_tp_moe_mode(void) {
+    if (!llama_tp_enabled()) return 0;
     const char * m = getenv("LLAMA_TP_MOE");
-    return llama_tp_enabled() && m && atoi(m) != 0;
+    if (!m) return 0;
+    if (strcmp(m, "tp") == 0 || strcmp(m, "tensor") == 0) return 2;
+    if (strcmp(m, "ep") == 0 || strcmp(m, "expert") == 0 || atoi(m) != 0) return 1;
+    return 0;
+}
+
+int llama_tp_moe_enabled(void) {
+    return llama_tp_moe_mode() != 0;
 }
 
 int llama_tp_rank(void) {

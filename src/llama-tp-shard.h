@@ -25,7 +25,16 @@ extern "C" {
 //         whole experts (each expert is a contiguous ne0*ne1 block), so it's a single read.
 typedef enum { TP_SHARD_NONE = 0, TP_SHARD_COLUMN, TP_SHARD_ROW, TP_SHARD_EXPERT } tp_shard_role;
 
-typedef struct { int size; int rank; int enabled; int attn; int moe; } tp_shard_config;
+// How a MoE model is parallelized across ranks (selectable, like LLAMA_SPLIT_MODE):
+//   OFF      experts not sharded (single-process MoE).
+//   EXPERT   expert parallelism: each rank owns n_expert/size whole experts (TP_SHARD_EXPERT).
+//            Scales to many ranks (capacity); routing is dynamic so compute is imbalanced.
+//   TENSOR   tensor parallelism on the experts: split each expert's intermediate (n_ff) like a
+//            dense FFN (gate/up COLUMN, down ROW). Balanced, splits compute even at decode, but
+//            limited by n_ff / quant-block size (down must stay block-aligned).
+typedef enum { TP_MOE_OFF = 0, TP_MOE_EXPERT = 1, TP_MOE_TENSOR = 2 } tp_moe_mode;
+
+typedef struct { int size; int rank; int enabled; int attn; int moe; tp_moe_mode moe_mode; } tp_shard_config;
 
 // Reads LLAMA_TP_SIZE and LLAMA_TP_RANK from the environment. enabled = (size > 1).
 // attn = (enabled && LLAMA_TP_ATTN); when set, attention (wq/wk/wv/wo) is sharded too
