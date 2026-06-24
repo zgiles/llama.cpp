@@ -33,7 +33,27 @@ cross-socket UPI). **tp-N**/**ep-N** = tensor/expert parallel over N sockets. `p
 | ep-N2 (sm) | 2 | 11.91 | 2.70 |
 | tp-N4 (IB) | 4 | **18.86** (+66%) | 3.00 |
 
-### Nemotron-3-Ultra (550B/55B-active, nemotron_h_moe) — *pending* (see below)
+### Nemotron-3-Ultra (550B/55B-active, Q4_K_M 334 GiB, nemotron_h_moe — Mamba-2 + MoE hybrid; 512 experts, 22 active)
+| config | sockets | tool | pp | tg |
+|---|---|---|---|---|
+| S2 (naive 2-sock) | 2 | llama-bench | 9.75 | 1.17 |
+| tp-N2 (sm) | 2 | llama-simple | — | ~0.54 |
+
+* **TP now applies to `nemotron_h_moe` and is CORRECT.** It routes through the shared `build_moe_ffn` but
+  with **no gate experts** (up → relu² → down; a LatentMoE with a latent projection around it). My `moe_par`
+  gate required `gate_exps`; relaxing it to `up_exps && down_exps` (one line) makes ep/tensor modes apply.
+  Tensor N2 output is coherent ("...Paris. ...Berlin."). This is the "flesh out a component for the hybrid"
+  step the model needed.
+* **But tensor mode does NOT speed Nemotron up** (tg ~0.54 vs S2 1.17; tool mismatch caveat — tensor was
+  measured with llama-simple, baseline with llama-bench, and there is no clean S1 number). Root cause:
+  Nemotron is a **Mamba-2 hybrid** — only the MoE-FFN layers shard; the **Mamba-2/attention layers are
+  replicated** and now run on half the threads per rank, plus per-MoE-layer all-reduce. The non-FFN
+  compute dominates, so FFN-only parallelism doesn't pay off.
+* **Lesson (good for the doc):** TP helps when the **MoE-FFN is the bottleneck** (DeepSeek). For
+  Mamba/attention-heavy hybrids, the SSM/attention layers must also be sharded — otherwise TP is overhead.
+* Practical: also load-heavy — tensor mode's loader reads ~full expert tensors per rank to extract the
+  `n_ff` slice; 334 GiB over shared NFS (2 ranks) took ~40 min. Local/NVMe weights or a chunked-strided
+  loader would make big-model tensor runs quick.
 
 ## Findings
 

@@ -250,6 +250,10 @@ Takeaways:
 * Tensor mode (`tp`) is bounded by `n_ff` / quant block alignment (see [MoE parallel modes](#moe-parallel-modes)).
 * Requires `-DGGML_CPU_REPACK=OFF` and `--no-mmap`.
 * Attention sharding (`LLAMA_TP_ATTN=1`) requires separate Q/K/V tensors (not a fused QKV).
+* **Hybrid models** (e.g. Mamba/SSM + MoE such as `nemotron_h_moe`) only have their MoE-FFN layers
+  sharded; the SSM and attention layers are replicated on every rank. TP runs correctly but only pays off
+  if the MoE-FFN is the bottleneck — for SSM/attention-dominated hybrids those layers must also be sharded.
+* Both gated (SwiGLU, `gate`+`up`+`down`) and non-gated (`up`+`down`, e.g. relu²) MoEs are supported.
 
 ## Glossary
 

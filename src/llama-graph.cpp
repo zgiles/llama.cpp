@@ -1983,7 +1983,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * sel_mm = selected_experts;
     const bool moe_solo = getenv("LLAMA_TP_MOE_SOLO") != nullptr;  // DEBUG: EP path, 1 proc, full experts
     const int  moe_mode = moe_solo ? TP_MOE_EXPERT : llama_tp_moe_mode();
-    const bool moe_par  = (moe_mode != TP_MOE_OFF) && gate_exps && down_exps && !gate_up_exps && !weight_before_ffn;
+    // up_exps (not gate_exps) is the always-present projection: gated MoEs (SwiGLU) have both, but some
+  // MoEs have no gate experts (e.g. nemotron_h_moe: up -> relu^2 -> down). Require up+down.
+  const bool moe_par  = (moe_mode != TP_MOE_OFF) && up_exps && down_exps && !gate_up_exps && !weight_before_ffn;
     if (moe_par && moe_mode == TP_MOE_EXPERT) {
         const int     tp_n   = moe_solo ? 1 : llama_tp_size();
         const int     tp_r   = moe_solo ? 0 : llama_tp_rank();
