@@ -359,6 +359,7 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool tp_attn;         // CPU tensor parallelism: also shard attention (heads) across ranks
+        bool tp_ssm;          // CPU tensor parallelism: also shard recurrent SSM/Mamba-2 mixer (heads)
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
