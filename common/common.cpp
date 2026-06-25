@@ -1563,6 +1563,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.tp_rank         = params.tp_rank;
     mparams.tp_port         = params.tp_port;
     mparams.tp_attn         = params.tp_attn;
+    mparams.tp_ssm          = params.tp_ssm;
     mparams.tp_peer         = params.tp_peer.empty() ? nullptr : params.tp_peer.c_str();
     mparams.moe_parallel    = params.moe_parallel;
     mparams.use_mmap        = params.use_mmap;

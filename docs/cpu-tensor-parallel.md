@@ -88,6 +88,7 @@ Rank 0 acts as a TCP rendezvous point for exchanging UCX addresses at startup (`
 | Dense FFN (`ffn_gate`/`ffn_up` column-parallel, `ffn_down` row-parallel) | always (when TP enabled) | intermediate dim `n_ff` |
 | Attention (`wq`/`wk`/`wv` column, `wo` row) | `LLAMA_TP_ATTN=1` | heads |
 | MLA attention (DeepSeek: `wq_b` column, `wk_b`/`wv_b` per-head, `wo` row) | `LLAMA_TP_ATTN=1` | query heads |
+| Recurrent SSM / Mamba-2 mixer (`ssm_in` column, scan per-head, `ssm_out` row) | `LLAMA_TP_SSM=1` | SSM heads / `d_inner` |
 | MoE routed experts | `LLAMA_TP_MOE=ep\|tp` | see [MoE parallel modes](#moe-parallel-modes) |
 
 The MoE router (`gate_inp`), shared expert, embeddings, and (unless `LLAMA_TP_ATTN=1`) attention are

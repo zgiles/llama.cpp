@@ -6,12 +6,12 @@
 // (llama_tp_set_config). Left at defaults (size <= 1), the accessors fall back to the legacy
 // LLAMA_TP_* environment variables so existing env-driven launches keep working. moe_mode uses the
 // same 0/1/2 encoding as llama_moe_parallel_mode / tp_moe_mode. peer/port feed the all-reduce bootstrap.
-static struct { int size, rank, moe_mode, attn, port; const char * peer; } g_tp = { 1, 0, 0, 0, 0, NULL };
+static struct { int size, rank, moe_mode, attn, ssm, port; const char * peer; } g_tp = { 1, 0, 0, 0, 0, 0, NULL };
 static char g_tp_peer[256];
 
-void llama_tp_set_config(int size, int rank, int moe_mode, int attn, const char * peer, int port) {
+void llama_tp_set_config(int size, int rank, int moe_mode, int attn, int ssm, const char * peer, int port) {
     g_tp.size = size; g_tp.rank = rank; g_tp.moe_mode = moe_mode;
-    g_tp.attn = attn; g_tp.port = port;
+    g_tp.attn = attn; g_tp.ssm = ssm; g_tp.port = port;
     // copy peer: it is consumed at inference time (the lazy all-reduce bootstrap), after the caller's
     // llama_model_params may be gone.
     if (peer && peer[0]) {
@@ -47,6 +47,16 @@ int llama_tp_attn_enabled(void) {
     if (tp_cfg_active()) return g_tp.attn != 0;
     const char * a = getenv("LLAMA_TP_ATTN");
     return a && atoi(a) != 0;
+}
+
+// SSM/Mamba-2 mixer sharding: when set, the recurrent SSM layers shard their heads/d_inner across
+// ranks (channel-parallel) with one all-reduce after ssm_out. Separate from attn so a hybrid can
+// shard SSM without standard attention and vice-versa.
+int llama_tp_ssm_enabled(void) {
+    if (!llama_tp_enabled()) return 0;
+    if (tp_cfg_active()) return g_tp.ssm != 0;
+    const char * s = getenv("LLAMA_TP_SSM");
+    return s && atoi(s) != 0;
 }
 
 // MoE-parallel mode (matches tp_moe_mode): 0=off, 1=expert-parallel, 2=tensor-parallel(experts).

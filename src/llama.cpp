@@ -379,6 +379,49 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     "n_head_kv=%u (tp_size=%d)\n", __func__, is_mla ? " (MLA)" : "",
                     hp.n_head_arr[0], hp.n_head_kv_arr[0], tp.size);
             }
+
+            // Recurrent SSM / Mamba-2 mixer: shard the SSM heads + d_inner (channel-parallel) by
+            // dividing the SSM hparams here, AFTER the full-dim tensors were created. The state cache
+            // (n_embd_r/n_embd_s) and build_mamba2_layer read these straight from hparams, so they then
+            // become rank-local automatically. The selective scan is per-head independent, so each rank
+            // scans only its heads; one all-reduce after ssm_out recombines. Groups are sharded only
+            // when n_group divides the rank count (each rank owns whole state groups); otherwise B/C are
+            // replicated — which is only valid without the grouped ssm_norm (it would couple a group's
+            // channels across ranks), so refuse that combination.
+            if (tp.ssm) {
+                auto & hp = model->hparams;
+                const uint32_t n_head  = hp.ssm_dt_rank;
+                const uint32_t d_inner = hp.ssm_d_inner;
+                const uint32_t n_group = hp.ssm_n_group;
+                if (n_head == 0 || d_inner == 0) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: model has no SSM layers to shard\n", __func__);
+                    return {-2, nullptr};
+                }
+                if (n_head % tp.size != 0 || d_inner % tp.size != 0) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: ssm n_head=%u d_inner=%u not divisible by "
+                        "tp_size=%d — refusing to shard SSM\n", __func__, n_head, d_inner, tp.size);
+                    return {-2, nullptr};
+                }
+                const bool shard_groups = (n_group % tp.size == 0);
+                bool has_ssm_norm = false;
+                for (const auto & layer : model->layers) {
+                    if (layer.ssm_norm) { has_ssm_norm = true; break; }
+                }
+                if (!shard_groups && has_ssm_norm) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: n_group=%u not divisible by tp_size=%d but the "
+                        "model has a grouped ssm_norm — cannot split a group across ranks; refusing\n",
+                        __func__, n_group, tp.size);
+                    return {-2, nullptr};
+                }
+                hp.ssm_dt_rank  /= tp.size;
+                hp.ssm_d_inner  /= tp.size;
+                if (shard_groups) {
+                    hp.ssm_n_group /= tp.size;
+                }
+                LLAMA_LOG_INFO("%s: tensor parallelism: SSM sharded — local n_head=%u d_inner=%u "
+                    "n_group=%u (groups %s, tp_size=%d)\n", __func__, hp.ssm_dt_rank, hp.ssm_d_inner,
+                    hp.ssm_n_group, shard_groups ? "sharded" : "replicated", tp.size);
+            }
         }
 
         return {0, model_ptr.release()};
@@ -417,7 +460,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     // CPU tensor parallelism: publish the requested config so the loader, graph builder and all-reduce
     // use it. When left at defaults (tp_size <= 1) the accessors fall back to the LLAMA_TP_* env vars.
     llama_tp_set_config(params.tp_size, params.tp_rank, (int) params.moe_parallel,
-                        params.tp_attn ? 1 : 0, params.tp_peer, params.tp_port);
+                        params.tp_attn ? 1 : 0, params.tp_ssm ? 1 : 0, params.tp_peer, params.tp_port);
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);

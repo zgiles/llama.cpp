@@ -18,6 +18,10 @@ int llama_tp_enabled(void);
 // so build_attn inserts an all-reduce after the row-parallel wo. Does NOT bootstrap the network.
 int llama_tp_attn_enabled(void);
 
+// Cheap env check (LLAMA_TP_SIZE > 1 && LLAMA_TP_SSM) — true when the recurrent SSM/Mamba-2 mixer is
+// sharded (heads/d_inner channel-parallel) so build_mamba2_layer all-reduces after ssm_out.
+int llama_tp_ssm_enabled(void);
+
 // Cheap env check — true when MoE experts are sharded across ranks (any mode) so build_moe_ffn
 // shards the expert FFN and all-reduces the combine.
 int llama_tp_moe_enabled(void);
@@ -32,7 +36,7 @@ int llama_tp_size(void);
 
 // Set the process-wide TP config from llama_model_params at model-load time. moe_mode uses the
 // 0/1/2 encoding (off/expert/tensor). When size <= 1, the accessors fall back to LLAMA_TP_* env.
-void llama_tp_set_config(int size, int rank, int moe_mode, int attn, const char * peer, int port);
+void llama_tp_set_config(int size, int rank, int moe_mode, int attn, int ssm, const char * peer, int port);
 
 // rank-0 bootstrap address / port for the all-reduce transport (config, else LLAMA_TP_PEER/PORT env).
 const char * llama_tp_peer(void);

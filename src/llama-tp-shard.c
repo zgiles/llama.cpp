@@ -11,6 +11,7 @@ tp_shard_config tp_shard_from_env(void) {
     c.attn     = llama_tp_attn_enabled();
     c.moe_mode = (tp_moe_mode) llama_tp_moe_mode();
     c.moe      = (c.moe_mode != TP_MOE_OFF);
+    c.ssm      = llama_tp_ssm_enabled();
     return c;
 }
 
@@ -23,6 +24,7 @@ int tp_shard_plan_make(tp_shard_role role, int rank, int size,
                        int64_t ne0_full, int64_t ne1_full, int64_t ne2_full,
                        int64_t block, size_t type_size,
                        tp_shard_plan * out) {
+    out->n_seg = 0;        // single-stride plan (not an SSM multi-segment gather)
     out->ne2 = ne2_full;   // unchanged except for EXPERT sharding
     if (size <= 1 || role == TP_SHARD_NONE) {
         out->ne0 = ne0_full; out->ne1 = ne1_full; out->nrows = ne1_full;

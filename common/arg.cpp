@@ -2642,6 +2642,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) { params.tp_attn = true; }
     ).set_env("LLAMA_ARG_TP_ATTN"));
     add_opt(common_arg(
+        {"--tp-ssm"},
+        "CPU tensor parallelism: also shard the recurrent SSM/Mamba-2 mixer (heads) across ranks",
+        [](common_params & params) { params.tp_ssm = true; }
+    ).set_env("LLAMA_ARG_TP_SSM"));
+    add_opt(common_arg(
         {"--tp-peer"}, "ADDR",
         "CPU tensor parallelism: rank-0 bootstrap address that non-zero ranks connect to (default: 127.0.0.1)",
         [](common_params & params, const std::string & value) { params.tp_peer = value; }

@@ -34,7 +34,7 @@ typedef enum { TP_SHARD_NONE = 0, TP_SHARD_COLUMN, TP_SHARD_ROW, TP_SHARD_EXPERT
 //            limited by n_ff / quant-block size (down must stay block-aligned).
 typedef enum { TP_MOE_OFF = 0, TP_MOE_EXPERT = 1, TP_MOE_TENSOR = 2 } tp_moe_mode;
 
-typedef struct { int size; int rank; int enabled; int attn; int moe; tp_moe_mode moe_mode; } tp_shard_config;
+typedef struct { int size; int rank; int enabled; int attn; int moe; tp_moe_mode moe_mode; int ssm; } tp_shard_config;
 
 // Reads LLAMA_TP_SIZE and LLAMA_TP_RANK from the environment. enabled = (size > 1).
 // attn = (enabled && LLAMA_TP_ATTN); when set, attention (wq/wk/wv/wo) is sharded too
@@ -42,6 +42,9 @@ typedef struct { int size; int rank; int enabled; int attn; int moe; tp_moe_mode
 // moe  = (enabled && LLAMA_TP_MOE); when set, MoE expert tensors (ffn_*_exps) are sharded
 // across ranks (expert parallelism): each rank holds n_expert/size experts.
 tp_shard_config tp_shard_from_env(void);
+
+// Max segments for an SSM concatenated-projection gather (z,x,B,C,dt = 5).
+#define TP_MAX_SEG 6
 
 // A load plan: `nrows` chunks of `chunk_bytes`, the i-th read from
 //   src: base_off + i*src_stride   ->   dst: i*chunk_bytes (contiguous).
@@ -52,6 +55,12 @@ typedef struct {
     size_t  base_off;     // byte offset of first chunk within the source tensor data
     size_t  src_stride;   // source stride between chunks
     size_t  total_bytes;  // == nrows * chunk_bytes (the sharded tensor size)
+    // SSM multi-segment gather: when n_seg>0 the rank's data is the concatenation of n_seg
+    // contiguous byte spans (one per kept sub-slice of a [z|x|B|C|dt]-style projection), packed
+    // into dst in order. Overrides the nrows/base_off/src_stride single-stride read above.
+    int     n_seg;
+    size_t  seg_src_off[TP_MAX_SEG]; // byte offset of each span in the source tensor data
+    size_t  seg_bytes[TP_MAX_SEG];   // bytes copied from each span (sum == total_bytes)
 } tp_shard_plan;
 
 // Compute the sharded shape + load plan. block = ggml_blck_size(type) (elements/block),

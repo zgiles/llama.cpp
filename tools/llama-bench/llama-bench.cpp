@@ -325,6 +325,7 @@ static struct {
     int                     rank = 0;
     int                     port = 0;
     bool                    attn = false;
+    bool                    ssm  = false;
     std::string             peer;
     llama_moe_parallel_mode moe  = LLAMA_MOE_PARALLEL_NONE;
 } g_tp;
@@ -472,6 +473,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --tp-rank <n>                               (CPU tensor parallelism: this rank's id)\n");
     printf("  --moe-parallel <none|expert|tensor>         (CPU tensor parallelism: MoE parallel mode)\n");
     printf("  --tp-attn                                   (CPU tensor parallelism: also shard attention)\n");
+    printf("  --tp-ssm                                    (CPU tensor parallelism: also shard SSM/Mamba-2 mixer)\n");
     printf("  --tp-peer <addr>                            (CPU tensor parallelism: rank-0 bootstrap address)\n");
     printf("  --tp-port <port>                            (CPU tensor parallelism: bootstrap port)\n");
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -806,6 +808,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 g_tp.peer = argv[i];
             } else if (arg == "--tp-attn") {
                 g_tp.attn = true;
+            } else if (arg == "--tp-ssm") {
+                g_tp.ssm = true;
             } else if (arg == "--moe-parallel") {
                 if (++i >= argc) { invalid_param = true; break; }
                 std::string v(argv[i]);
@@ -1241,6 +1245,7 @@ struct cmd_params_instance {
         mparams.tp_rank      = g_tp.rank;
         mparams.tp_port      = g_tp.port;
         mparams.tp_attn      = g_tp.attn;
+        mparams.tp_ssm       = g_tp.ssm;
         mparams.tp_peer      = g_tp.peer.empty() ? nullptr : g_tp.peer.c_str();
         mparams.moe_parallel = g_tp.moe;
 
