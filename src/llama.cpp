@@ -355,11 +355,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     }
                 }
                 for (const auto & layer : model->layers) {
-                    if (layer.wqkv) {
-                        LLAMA_LOG_ERROR("%s: LLAMA_TP_ATTN: model uses fused QKV, "
-                            "which attention sharding does not support yet\n", __func__);
-                        return {-2, nullptr};
-                    }
+                    // Fused QKV (wqkv) is now handled: a standard [Wq|Wk|Wv] weight is sharded per-head
+                    // by the loader (tp_qkv_plan_for); a non-standard wqkv (e.g. a gated-delta-net mixer)
+                    // is left replicated while the layer's separate attention (if any) still shards.
                     // wq_b/wk_b/wv_b are the MLA per-head latent projections. They are sharded for
                     // MLA models; on a non-MLA model they would be the legacy unabsorbed path we
                     // do not handle, so refuse there.

@@ -1227,6 +1227,77 @@ static int tp_ssm_plan_for(llm_tensor t, const llama_hparams & hp, int rank, int
     return 1;
 }
 
+// Build this rank's load plan for a FUSED QKV attention weight (LLM_TENSOR_ATTN_QKV). The tensor is
+// [ Wq(n_head*head_dim) | Wk(n_head_kv*head_dim) | Wv(n_head_kv*head_dim) ] concatenated along the
+// output dim, so the per-head shard is the same multi-segment column gather used for ssm_in: this
+// rank takes its query-head slice of Wq and kv-head slice of Wk/Wv. Only applies to a *standard*
+// fused QKV (identified by the output dim matching n_head*hd + 2*n_head_kv*hd); anything else with an
+// ATTN_QKV name (e.g. a gated-delta-net mixer's wqkv) has a different width -> returns 0 so it stays
+// replicated. Returns 0 (not a standard fused QKV), 1 (plan filled), or -1 (can't split this way).
+static int tp_qkv_plan_for(llm_tensor t, const llama_hparams & hp, int rank, int size,
+                           const ggml_tensor * cur, tp_shard_plan * out) {
+    if (t != LLM_TENSOR_ATTN_QKV) return 0;
+    const int64_t hd = hp.n_embd_head_k();
+    const int64_t nq = (int64_t) hp.n_head()    * hd;
+    const int64_t nk = (int64_t) hp.n_head_kv() * hd;
+    const int64_t seg[3] = { nq, nk, nk };            // Wq, Wk, Wv output widths
+    const bool    is_1d  = ggml_n_dims(cur) < 2;      // the bias is 1D
+    const int64_t axis   = is_1d ? cur->ne[0] : cur->ne[1];
+    if (axis != nq + 2 * nk) return 0;                // not a standard fused QKV -> leave replicated
+    if (hp.n_head() % size != 0 || hp.n_head_kv() % size != 0) return -1;
+
+    const int64_t block = ggml_blck_size(cur->type);
+    const size_t  tsz   = ggml_type_size(cur->type);
+    if (is_1d && block != 1) return -1;               // 1D bias must be block 1 (F32) to slice by head
+    const size_t unit = is_1d ? tsz : (size_t)(cur->ne[0] / block) * tsz;
+
+    int64_t run = 0, kept = 0;
+    out->n_seg = 0;
+    for (int i = 0; i < 3; i++) {
+        if (seg[i] % size != 0) return -1;
+        const int64_t w = seg[i] / size, off = run + (int64_t) rank * w;
+        out->seg_src_off[out->n_seg] = (size_t) off * unit;
+        out->seg_bytes[out->n_seg]   = (size_t) w   * unit;
+        out->n_seg++;
+        kept += w;
+        run  += seg[i];
+    }
+    out->total_bytes = (size_t) kept * unit;
+    out->ne2 = cur->ne[2];
+    if (is_1d) { out->ne0 = kept;       out->ne1 = cur->ne[1]; }
+    else       { out->ne0 = cur->ne[0]; out->ne1 = kept; }
+    out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
+    return 1;
+}
+
+// Build this rank's load plan for a FUSED gate/up FFN weight (LLM_TENSOR_FFN_UP holding [gate|up]
+// concatenated, ne[1] == 2*n_ff — e.g. Phi-3, used with LLM_FFN_SWIGLU). A plain COLUMN split would
+// cut the gate|up seam (giving one rank all of gate, another all of up); instead take this rank's
+// column slice of EACH half so the swiglu stays channel-aligned. Returns 0 if not a fused gate/up
+// (normal separate ffn_up, ne[1]==n_ff -> generic COLUMN), 1 with plan, or -1 if it can't split.
+static int tp_gate_up_plan_for(llm_tensor t, const llama_hparams & hp, int rank, int size,
+                               const ggml_tensor * cur, tp_shard_plan * out) {
+    if (t != LLM_TENSOR_FFN_UP) return 0;
+    const int64_t n_ff = hp.n_ff();
+    if (cur->ne[1] != 2 * n_ff) return 0;             // not a fused gate|up -> generic COLUMN path
+    if (n_ff % size != 0) return -1;
+    const int64_t block = ggml_blck_size(cur->type);
+    const size_t  tsz   = ggml_type_size(cur->type);
+    const size_t  unit  = (size_t)(cur->ne[0] / block) * tsz;   // bytes per output row (ne0 = n_embd)
+    const int64_t w = n_ff / size;
+    out->n_seg = 0;
+    for (int i = 0; i < 2; i++) {                     // half 0 = gate, half 1 = up
+        const int64_t off = (int64_t) i * n_ff + (int64_t) rank * w;
+        out->seg_src_off[out->n_seg] = (size_t) off * unit;
+        out->seg_bytes[out->n_seg]   = (size_t) w   * unit;
+        out->n_seg++;
+    }
+    out->total_bytes = (size_t) (2 * w) * unit;
+    out->ne0 = cur->ne[0]; out->ne1 = 2 * w; out->ne2 = cur->ne[2];
+    out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
+    return 1;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1464,7 +1535,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bool tp_sharded = false;
     bool tp_refused = false;          // a TP role applied but the shape can't be split this many ways
     const char * tp_why = "";
-    if (tp_cfg.enabled && tp_cfg.ssm) {
+    if (tp_cfg.enabled) {
+        // Fused gate|up FFN weight needs the 2-segment gather (else the swiglu seam is cut). Always-on.
+        const int r = tp_gate_up_plan_for(tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
+        if (r == 1)       { tp_sharded = true; }
+        else if (r == -1) { tp_refused = true; }
+    }
+    if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.attn) {
+        // Fused QKV attention weight/bias needs the per-head multi-segment gather (hparams-aware).
+        const int r = tp_qkv_plan_for(tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
+        if (r == 1)       { tp_sharded = true; }
+        else if (r == -1) { tp_refused = true; }
+    }
+    if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.ssm) {
         // SSM/Mamba-2 concatenated projections need the multi-segment gather (hparams-aware).
         const int r = tp_ssm_plan_for(tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
         if (r == 1)       { tp_sharded = true; }
