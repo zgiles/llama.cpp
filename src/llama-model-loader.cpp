@@ -1992,16 +1992,21 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
-                // CPU tensor parallelism: gather this rank's (possibly strided) slice.
-                auto tp_it = tp_plans.find(ggml_get_name(cur));
-                if (tp_it != tp_plans.end()) {
-                    const tp_shard_plan & pl = tp_it->second;
-                    tp_read_shard(file.get(), weight->offs, pl, (uint8_t *) cur->data);
-                } else {
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(cur->data, n_size);
+            // CPU tensor parallelism: gather this rank's (possibly strided) shard into a staging buffer
+            // and set it via the backend, so a repack/extra (non-host) buffer transforms it the same way
+            // it would a full tensor. Writing straight to tensor->data would skip that transform and a
+            // repack buffer would then read raw quant bytes as repacked -> garbage (Q4_K on VNNI hosts).
+            auto tp_it = tp_plans.find(ggml_get_name(cur));
+            if (tp_it != tp_plans.end()) {
+                std::vector<uint8_t> shard(n_size);
+                tp_read_shard(file.get(), weight->offs, tp_it->second, shard.data());
+                if (check_tensors && !ggml_validate_row_data(cur->type, shard.data(), n_size)) {
+                    throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                 }
+                ggml_backend_tensor_set(cur, shard.data(), 0, n_size);
+            } else if (ggml_backend_buffer_is_host(cur->buffer)) {
+                file->seek(weight->offs, SEEK_SET);
+                file->read_raw(cur->data, n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
