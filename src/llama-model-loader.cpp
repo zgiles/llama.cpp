@@ -1065,18 +1065,42 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 // split Q/KV heads), wo row-parallel (split the contraction == per-head input) + all-reduce.
 // Column-splitting wq/wk/wv reduces the local head counts; the loader compensates by dividing
 // hparams.n_head/n_head_kv so build_qkv, build_attn and the KV cache use per-rank head counts.
-static tp_shard_role tp_role_for_tensor(llm_tensor t, int attn, int ssm, tp_moe_mode moe_mode) {
-    // SSM/Mamba-2 mixer channel sharding. The concatenated ssm_in/ssm_conv1d/ssm_dt tensors are
-    // handled separately (tp_ssm_plan_for); here only the simple per-head / per-group / output ones:
-    //   ssm_a, ssm_d {1,n_head}  -> COLUMN (split n_head); ssm_norm {.,n_group} -> COLUMN (split groups)
-    //   ssm_out {d_inner,n_embd} -> ROW (split d_inner) + all-reduce.
+// Gated-delta-net (linear attention) mixers — Qwen3-Next / Qwen3.5 / Qwen3.5-MoE — reuse the SSM
+// tensor names but have a different concatenation layout and a per-head-dim (not grouped) ssm_norm,
+// so they take a separate shard path (tp_gdn_plan_for) and separate output/replicate roles below.
+static bool tp_is_gdn_arch(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static tp_shard_role tp_role_for_tensor(llm_arch arch, llm_tensor t, int attn, int ssm, tp_moe_mode moe_mode) {
+    // Recurrent-mixer output / replicate roles. The concatenated projections are handled earlier by
+    // tp_ssm_plan_for (Mamba-2) or tp_gdn_plan_for (gated-delta-net); only the simple ones are here.
     if (ssm) {
-        switch (t) {
-            case LLM_TENSOR_SSM_A:
-            case LLM_TENSOR_SSM_D:
-            case LLM_TENSOR_SSM_NORM: return TP_SHARD_COLUMN;
-            case LLM_TENSOR_SSM_OUT:  return TP_SHARD_ROW;
-            default: break;
+        if (tp_is_gdn_arch(arch)) {
+            // gated-delta-net: ssm_out {value_dim,n_embd} -> ROW (split value_dim) + all-reduce;
+            // ssm_norm {head_v_dim} is per-head-dim (identical across heads) -> replicate.
+            switch (t) {
+                case LLM_TENSOR_SSM_OUT:  return TP_SHARD_ROW;
+                case LLM_TENSOR_SSM_NORM: return TP_SHARD_NONE;
+                default: break;
+            }
+        } else {
+            // Mamba-2: ssm_a, ssm_d {1,n_head} -> COLUMN (split n_head); ssm_norm {.,n_group} -> COLUMN
+            //   (split groups); ssm_out {d_inner,n_embd} -> ROW (split d_inner) + all-reduce.
+            switch (t) {
+                case LLM_TENSOR_SSM_A:
+                case LLM_TENSOR_SSM_D:
+                case LLM_TENSOR_SSM_NORM: return TP_SHARD_COLUMN;
+                case LLM_TENSOR_SSM_OUT:  return TP_SHARD_ROW;
+                default: break;
+            }
         }
     }
     switch (t) {
@@ -1294,6 +1318,75 @@ static int tp_gate_up_plan_for(llm_tensor t, const llama_hparams & hp, int rank,
     }
     out->total_bytes = (size_t) (2 * w) * unit;
     out->ne0 = cur->ne[0]; out->ne1 = 2 * w; out->ne2 = cur->ne[2];
+    out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
+    return 1;
+}
+
+// Build this rank's load plan for a gated-delta-net (linear attention) mixer weight — Qwen3-Next /
+// Qwen3.5 / Qwen3.5-MoE. GDN is head-parallel: shard the k-heads (ssm_n_group) and v-heads
+// (ssm_dt_rank) across ranks. The concatenated projections are gathered per-segment like ssm_in:
+//   wqkv (ATTN_QKV) : [ q(key_dim) | k(key_dim) | v(value_dim) ]  key_dim=d_state*n_k, value_dim=d_inner
+//   ssm_conv1d      : [ q(key_dim) | k(key_dim) | v(value_dim) ]  (depthwise; channels in q|k|v order)
+//   ssm_beta_alpha  : per-k-group [beta|alpha] blocks (interleaved) -> contiguous by k-group (qwen3next)
+//   ssm_beta, ssm_alpha : {n_embd, n_v} separate per-v-head projections (qwen35 / qwen35moe)
+//   wqkv_gate (ATTN_GATE) : [ z(value_dim) ]                       (single sharded segment)
+//   ssm_dt / ssm_a  : {n_v} 1-D per-v-head vectors
+// ssm_out (ROW split) and ssm_norm ({head_v_dim}, replicated) go through tp_role_for_tensor instead.
+// The legacy fused ssm_in ([q|k|v|z]) path is not supported yet -> refuse. Returns 0 for a non-GDN
+// arch / unrecognised tensor (fall through), 1 with the plan, or -1 if a segment can't split N ways.
+static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp, int rank, int size,
+                           const ggml_tensor * cur, tp_shard_plan * out) {
+    if (!tp_is_gdn_arch(arch)) return 0;
+    const int64_t d_state   = hp.ssm_d_state;
+    const int64_t n_v_heads = hp.ssm_dt_rank;
+    const int64_t key_dim   = d_state * hp.ssm_n_group;   // per k-head-group key/query width
+    const int64_t value_dim = hp.ssm_d_inner;             // = d_state * n_v_heads
+
+    int64_t seg[3];
+    int     nseg = 0;
+    int     axis;   // 1 = split ne[1] (2D weight rows); 0 = split ne[0] (1D vector)
+    switch (t) {
+        case LLM_TENSOR_ATTN_QKV:                                 // [q|k|v]
+            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim; axis = 1; break;
+        case LLM_TENSOR_SSM_CONV1D:                               // depthwise conv, channels [q|k|v]
+            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim;
+            axis = ggml_n_dims(cur) >= 2 ? 1 : 0; break;
+        case LLM_TENSOR_ATTN_GATE:                                // z gate [value_dim]
+            seg[nseg++] = value_dim; axis = 1; break;
+        case LLM_TENSOR_SSM_BETA_ALPHA:                           // per-k-group [beta|alpha] blocks,
+            seg[nseg++] = 2 * n_v_heads; axis = 1; break;         // contiguous by k-group (n_k % size == 0)
+        case LLM_TENSOR_SSM_BETA:                                 // {n_embd, n_v} per-v-head, separate
+        case LLM_TENSOR_SSM_ALPHA:                                // beta/alpha (qwen35 / qwen35moe)
+            seg[nseg++] = n_v_heads; axis = 1; break;
+        case LLM_TENSOR_SSM_DT:                                   // bias {n_v} (1D)
+        case LLM_TENSOR_SSM_A_NOSCAN:                             // {n_v} (1D)
+            seg[nseg++] = n_v_heads; axis = 0; break;
+        case LLM_TENSOR_SSM_IN:                                   // legacy fused [q|k|v|z] not supported
+            return -1;
+        default:
+            return 0;
+    }
+
+    const int64_t block = ggml_blck_size(cur->type);
+    const size_t  tsz   = ggml_type_size(cur->type);
+    if (axis == 0 && block != 1) return -1;   // 1D vectors are F32; can't slice a quant block by element
+    const size_t unit = axis == 1 ? (size_t)(cur->ne[0] / block) * tsz : tsz;
+
+    int64_t run = 0, kept = 0;
+    out->n_seg = 0;
+    for (int i = 0; i < nseg; i++) {
+        if (seg[i] % size != 0) return -1;               // segment can't split evenly this many ways
+        const int64_t w = seg[i] / size, off = run + (int64_t) rank * w;
+        out->seg_src_off[out->n_seg] = (size_t) off * unit;
+        out->seg_bytes[out->n_seg]   = (size_t) w   * unit;
+        out->n_seg++;
+        kept += w;
+        run  += seg[i];
+    }
+    out->total_bytes = (size_t) kept * unit;
+    out->ne2 = cur->ne[2];
+    if (axis == 1) { out->ne0 = cur->ne[0]; out->ne1 = kept; }
+    else           { out->ne0 = kept;       out->ne1 = cur->ne[1]; }
     out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
     return 1;
 }
@@ -1548,13 +1641,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         else if (r == -1) { tp_refused = true; }
     }
     if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.ssm) {
+        // Gated-delta-net (Qwen3-Next/3.5) mixer projections: per-head multi-segment gather. Checked
+        // before the Mamba-2 path since GDN reuses the SSM tensor names with a different layout.
+        // Use the loader's arch (from the GGUF): tn.arch is bound at model construction, before the
+        // real arch is known, so it can be UNKNOWN here.
+        const int r = tp_gdn_plan_for(get_arch(), tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
+        if (r == 1)       { tp_sharded = true; }
+        else if (r == -1) { tp_refused = true; }
+    }
+    if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.ssm) {
         // SSM/Mamba-2 concatenated projections need the multi-segment gather (hparams-aware).
         const int r = tp_ssm_plan_for(tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
         if (r == 1)       { tp_sharded = true; }
         else if (r == -1) { tp_refused = true; }
     }
     if (!tp_sharded && !tp_refused && tp_cfg.enabled) {
-        tp_shard_role tp_role = tp_role_for_tensor(tn.tensor, tp_cfg.attn, tp_cfg.ssm, tp_cfg.moe_mode);
+        tp_shard_role tp_role = tp_role_for_tensor(get_arch(), tn.tensor, tp_cfg.attn, tp_cfg.ssm, tp_cfg.moe_mode);
         if (tp_role != TP_SHARD_NONE) {
             if (tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, cur->ne[0], cur->ne[1], cur->ne[2],
                                    ggml_blck_size(cur->type), ggml_type_size(cur->type), &tp_plan) == 0) {
