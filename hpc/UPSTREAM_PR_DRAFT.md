@@ -44,6 +44,9 @@ no-op and the build is unaffected. Activated per model load via params/CLI (off 
 
 ## Performance (CPU, Xeon Skylake/Cascade, rank=socket, validated token-for-token correct)
 
+> Full consolidated results table (every model + config tried): see `hpc/PERF_RESULTS.md`.
+
+
 | Model | Config | Result |
 |---|---|---|
 | 70B dense Q8 | 4-way rank=socket (1 node) | **decode 4.0× single**, RAM −48% |
