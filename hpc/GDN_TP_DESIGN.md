@@ -72,11 +72,18 @@ Weight shard plans verified byte-exact via LLAMA_TP_GDN_DEBUG. Two bugs found + 
    `ssm_beta_alpha`); added both to `tp_gdn_plan_for`. Also `ssm_beta_alpha` is per-k-group interleaved
    (contiguous split, not 2-seg).
 
-### Known separate bug (NOT GDN, pre-existing base TP): Q4_K FFN sharding
-Qwen3.5-27B **Q4_K_M** produces garbage under 2-socket TP even with **FFN-only** sharding (no GDN/attn),
-while **Q8_0 works** and Qwen2.5-14B Q8_0 works. n_ff=17408 (/2=8704=34×256, properly block-aligned),
-so it's not a simple alignment refuse. Prior Phi-3 Q4 worked on the same node, so it's qwen35-Q4 specific.
-Needs its own investigation — likely a Q4_K ffn_down ROW-split / repack(q4_K_8x8) interaction. Blocks
-using Q4 on these nodes for the hybrids until fixed; use Q8_0 meanwhile.
+### Base-TP bug FIXED: sharded tensors + online repack (was "Q4_K FFN garbage")
+Root cause (general, not GDN): a sharded weight inherited the buffer type picked from its FULL metadata,
+which on AVX-512-VNNI hosts is the online-repack extra buffer. Our shard loader wrote the raw slice
+straight to tensor->data, bypassing the buffer's set_tensor transform, so a repack buffer read raw quant
+bytes as repacked -> garbage. Only repack-path quants (Q4_K etc.) on a repack-capable host hit it;
+Q8_0 / non-VNNI worked, hiding it. FIX (commit 38f47f52c): stage the shard and hand it to
+ggml_backend_tensor_set (the same path a full tensor uses) — host buffers memcpy, repack buffers repack
+in place, so the shards KEEP the SIMD layout. This is a TP-integration fix, not an upstream bug (normal
+loading already repacks correctly). **Fixes Q4 TP for ALL models on VNNI hosts (dense/MoE too).**
+
+### Perf (Qwen3.5-27B Q4_K_M, tonto92 Cascade Lake, 2-socket full TP vs 1-socket)
+prefill 25.46 -> **45.74 t/s (+80%, 1.80x)**; decode 4.15 -> **7.08 t/s (+71%, 1.71x)**. (With the shards
+skipping repack the numbers were +0%/-5% and +21% — repack matters a lot for both.)
 
 TODO: token-for-token vs single-rank (currently "coherent" check); 2-socket decode/prefill perf numbers.

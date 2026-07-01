@@ -14,6 +14,7 @@ Cascade Lake 8260 (node 92). "N-way" = N NUMA sockets; ≤2-way is single-node (
 | Phi-3-mini (fused QKV + fused gate\|up) | Q4 | 1-sock → 2-sock TP | 77.3→142.0 | 15.4→**33.6** | **2.18× tg, 1.84× pp** (near-linear) |
 | InternLM2-7B (GQA) | Q4 | 1-sock → 2-sock TP | 46.3→86.6 | 8.95→**14.2** | **1.59× tg, 1.87× pp** |
 | Qwen3.6-27B (dense hybrid, gated-delta-net) | Q4 | 1-sock → 2-sock FFN-only TP | — | 3.07→3.78 | +23% (attn/gdn replicated) |
+| **Qwen3.5-27B (hybrid, GDN sharded)** | Q4_K | 1-sock → 2-sock full TP (GDN+attn+FFN) | 25.5→**45.7** | 4.15→**7.08** | **+80% pp, +71% tg** (GDN TP + repack fix) |
 
 ## MoE models — decode is bandwidth-bound (~3–4 t/s ceiling); tensor-TP is the lever
 
