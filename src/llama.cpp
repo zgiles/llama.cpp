@@ -412,6 +412,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     model->arch == LLM_ARCH_QWEN35    ||
                     model->arch == LLM_ARCH_QWEN35MOE;
                 const bool repl_k = is_gdn && (n_group != n_head);
+                // With k-heads replicated, each rank keeps all num_k (n_group) k-heads and its slice of
+                // num_v (n_head) v-heads; the mixer then re-expands k up to the LOCAL v-head count via
+                // ggml_repeat, which requires (n_head/size) to be a whole multiple of n_group. That holds
+                // for e.g. num_v=32,num_k=16,size=2 (16 % 16 == 0) but NOT num_v=48,num_k=16,size=2
+                // (24 % 16 != 0). The general case needs sharding by k-group with a strided v-head gather
+                // (not yet implemented); until then, refuse cleanly rather than crash in graph build.
+                if (repl_k && (n_head / tp.size) % n_group != 0) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: gated-delta-net num_v_heads=%u / tp_size=%d = %u is "
+                        "not a multiple of num_k_heads=%u — this k-head sharding layout is not supported "
+                        "yet; use a tp_size that divides num_v_heads into a multiple of num_k_heads, or "
+                        "shard attention/FFN only\n", __func__, n_head, tp.size, n_head / tp.size, n_group);
+                    return {-2, nullptr};
+                }
                 const bool shard_groups = !repl_k && (n_group % tp.size == 0);
                 bool has_ssm_norm = false;
                 for (const auto & layer : model->layers) {
