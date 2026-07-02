@@ -140,6 +140,14 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
+        // Debug (LLAMA_TP_ATTN_DUMP): per-layer mixer-output checksum, to compare sharded vs 1-socket.
+        if (getenv("LLAMA_TP_ATTN_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "mix_%s_l%d", hparams.is_recr(il) ? "R" : "A", il);
+            cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_dump_op, 1, nullptr);
+            ggml_set_name(cur, nm);
+        }
+
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);

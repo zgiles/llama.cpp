@@ -1372,10 +1372,19 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     const int64_t nk_loc = nk / size;
     const int64_t hv     = value_dim / nv;                // head_v_dim
 
-    // ssm_out (row-parallel {value_dim, n_embd}): the contraction dim ne0 = head_v_dim*num_v is v-head-
-    // structured, so this rank's value channels are R strided runs of nk_loc*hv along ne0. Gather them
-    // per output row with the strided-row read.
+    // Two GDN head-pairing conventions decide how v-heads map to k-heads and thus how to shard:
+    //  - MODULAR (qwen35 / qwen35moe): the mixer tiles q/k so v-head p uses k-head (p mod num_k) — v-heads
+    //    are v-head-major, so this rank's v-heads are R STRIDED runs (stride num_k). Separate ssm_beta/alpha.
+    //  - BLOCK/interleave (qwen3next): the mixer repeat-interleaves so v-head p uses k-head (p / R) — v-heads
+    //    are k-group-major, so this rank's v-heads are ONE CONTIGUOUS run, ssm_out is a plain ROW split, and
+    //    beta/alpha are a single fused ssm_ba tensor laid out per-k-group ([beta(R)|alpha(R)] each k-head).
+    const bool block_pairing = (arch == LLM_ARCH_QWEN3NEXT);
+
+    // ssm_out (row-parallel {value_dim, n_embd}): its contraction dim ne0 = head_v_dim*num_v is v-head-
+    // structured. Block pairing -> the rank's v-heads are contiguous -> a plain contiguous ROW split works
+    // (fall through to tp_role_for_tensor). Modular -> R strided runs along ne0, gathered per output row.
     if (t == LLM_TENSOR_SSM_OUT) {
+        if (block_pairing) return 0;   // contiguous ROW split via the generic path
         const int64_t block = ggml_blck_size(cur->type);
         if ((nk_loc*hv) % block != 0 || (nk*hv) % block != 0) return -1;   // runs must be block-aligned
         out->n_seg      = 0;
@@ -1415,8 +1424,10 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
         case LLM_TENSOR_SSM_DT:                            // bias {n_v} (1D)
         case LLM_TENSOR_SSM_A_NOSCAN:                      // {n_v} (1D)
             field[nf++] = {1, 1}; axis = 0; break;
-        case LLM_TENSOR_SSM_BETA_ALPHA:                    // qwen3next fused per-k-group [beta|alpha] —
-            return -1;                                     // interleaved layout, not supported by this gather
+        case LLM_TENSOR_SSM_BETA_ALPHA:                    // qwen3next fused ssm_ba {n_embd, 2*num_v}: per
+            // k-head block of [beta(R)|alpha(R)] (k-group-major) -> shard contiguously by k-group, width 2R.
+            if (!block_pairing) return -1;                 // modular archs use separate ssm_beta / ssm_alpha
+            field[nf++] = {0, 2*R}; axis = 1; break;
         case LLM_TENSOR_SSM_IN:                            // legacy fused [q|k|v|z] not supported
             return -1;
         default:
@@ -1438,7 +1449,14 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
             out->seg_bytes[out->n_seg]   = (size_t)(nk_loc * phw) * unit;
             out->n_seg++; kept += nk_loc * phw;
             base += nk * phw;
-        } else {                                           // V-field: R strided runs of nk_loc heads
+        } else if (block_pairing) {                        // V-field, block: ONE contiguous nv_loc run
+            const int64_t nv_loc = R * nk_loc;
+            if (out->n_seg >= TP_MAX_SEG) return -1;
+            out->seg_src_off[out->n_seg] = (size_t)(base + (int64_t) rank * nv_loc * phw) * unit;
+            out->seg_bytes[out->n_seg]   = (size_t)(nv_loc * phw) * unit;
+            out->n_seg++; kept += nv_loc * phw;
+            base += nv * phw;
+        } else {                                           // V-field, modular: R strided runs of nk_loc heads
             for (int64_t run = 0; run < R; run++) {
                 if (out->n_seg >= TP_MAX_SEG) return -1;
                 out->seg_src_off[out->n_seg] = (size_t)(base + (run*nk + (int64_t) rank*nk_loc) * phw) * unit;
