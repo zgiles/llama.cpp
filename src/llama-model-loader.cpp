@@ -1388,6 +1388,14 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     if (axis == 1) { out->ne0 = cur->ne[0]; out->ne1 = kept; }
     else           { out->ne0 = kept;       out->ne1 = cur->ne[1]; }
     out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
+    if (getenv("LLAMA_TP_GDN_DEBUG")) {
+        LLAMA_LOG_INFO("tp_gdn: '%s' %s ne=[%lld,%lld] axis=%d unit=%zu nseg=%d ->", ggml_get_name(cur),
+            ggml_type_name(cur->type), (long long)cur->ne[0], (long long)cur->ne[1], axis, unit, out->n_seg);
+        for (int i = 0; i < out->n_seg; i++) {
+            LLAMA_LOG_INFO(" [off=%zu bytes=%zu]", out->seg_src_off[i], out->seg_bytes[i]);
+        }
+        LLAMA_LOG_INFO(" -> ne=[%lld,%lld]\n", (long long)out->ne0, (long long)out->ne1);
+    }
     return 1;
 }
 
