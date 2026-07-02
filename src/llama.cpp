@@ -400,51 +400,52 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                         "tp_size=%d — refusing to shard SSM\n", __func__, n_head, d_inner, tp.size);
                     return {-2, nullptr};
                 }
-                // Gated-delta-net (Qwen3-Next/3.5/3.5-MoE): its n_group == num_k_heads is a GQA sharing
-                // count coupled to the num_v_heads (n_head) via a MODULAR repeat (v-head p uses k-head
-                // p mod n_group). When n_group != n_head, the k-heads CANNOT be block-sharded to match a
-                // block v-head split — so keep them REPLICATED (the loader keeps the q,k projection
-                // segments full). Its ssm_norm is per-v-head (replicated), not grouped, so the grouped-
-                // norm guard below does not apply to GDN. When n_group == n_head, the pairing is identity
-                // and block-sharding groups is correct (as for Mamba-2).
+                // Gated-delta-net (Qwen3-Next/3.5/3.5-MoE): n_group == num_k_heads, ssm_dt_rank == num_v_heads,
+                // coupled by a MODULAR repeat (v-head p uses k-head p mod num_k). Shard by K-GROUP: each rank
+                // gets n_group/size k-heads and the R = num_v/num_k STRIDED runs of v-heads that pair to them
+                // (the loader's tp_gdn_plan_for does the strided gather + strided ssm_out). This preserves the
+                // local ratio R so the mixer's repeat and the fused op work unchanged. Requires n_group % size
+                // == 0 and num_v % num_k == 0. Its ssm_norm is per-v-head (replicated), not grouped, so the
+                // Mamba-2 grouped-norm guard does not apply.
                 const bool is_gdn =
                     model->arch == LLM_ARCH_QWEN3NEXT ||
                     model->arch == LLM_ARCH_QWEN35    ||
                     model->arch == LLM_ARCH_QWEN35MOE;
-                const bool repl_k = is_gdn && (n_group != n_head);
-                // With k-heads replicated, each rank keeps all num_k (n_group) k-heads and its slice of
-                // num_v (n_head) v-heads; the mixer then re-expands k up to the LOCAL v-head count via
-                // ggml_repeat, which requires (n_head/size) to be a whole multiple of n_group. That holds
-                // for e.g. num_v=32,num_k=16,size=2 (16 % 16 == 0) but NOT num_v=48,num_k=16,size=2
-                // (24 % 16 != 0). The general case needs sharding by k-group with a strided v-head gather
-                // (not yet implemented); until then, refuse cleanly rather than crash in graph build.
-                if (repl_k && (n_head / tp.size) % n_group != 0) {
-                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: gated-delta-net num_v_heads=%u / tp_size=%d = %u is "
-                        "not a multiple of num_k_heads=%u — this k-head sharding layout is not supported "
-                        "yet; use a tp_size that divides num_v_heads into a multiple of num_k_heads, or "
-                        "shard attention/FFN only\n", __func__, n_head, tp.size, n_head / tp.size, n_group);
-                    return {-2, nullptr};
-                }
-                const bool shard_groups = !repl_k && (n_group % tp.size == 0);
-                bool has_ssm_norm = false;
-                for (const auto & layer : model->layers) {
-                    if (layer.ssm_norm) { has_ssm_norm = true; break; }
-                }
-                if (!shard_groups && has_ssm_norm && !is_gdn) {
-                    LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: n_group=%u not divisible by tp_size=%d but the "
-                        "model has a grouped ssm_norm — cannot split a group across ranks; refusing\n",
-                        __func__, n_group, tp.size);
-                    return {-2, nullptr};
-                }
-                hp.ssm_dt_rank  /= tp.size;
-                hp.ssm_d_inner  /= tp.size;
-                if (shard_groups) {
+                if (is_gdn) {
+                    if (n_group == 0 || n_group % tp.size != 0 || n_head % n_group != 0) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: gated-delta-net needs num_k_heads(n_group)=%u "
+                            "divisible by tp_size=%d and num_v_heads=%u a multiple of num_k_heads — cannot "
+                            "shard this GDN layout %d ways; shard attention/FFN only or pick another tp_size\n",
+                            __func__, n_group, tp.size, n_head, tp.size);
+                        return {-2, nullptr};
+                    }
+                    hp.ssm_dt_rank /= tp.size;
+                    hp.ssm_d_inner /= tp.size;
                     hp.ssm_n_group /= tp.size;
+                    LLAMA_LOG_INFO("%s: tensor parallelism: gated-delta-net sharded — local num_v_heads=%u "
+                        "d_inner=%u num_k_heads=%u (tp_size=%d)\n", __func__, hp.ssm_dt_rank, hp.ssm_d_inner,
+                        hp.ssm_n_group, tp.size);
+                } else {
+                    const bool shard_groups = (n_group % tp.size == 0);
+                    bool has_ssm_norm = false;
+                    for (const auto & layer : model->layers) {
+                        if (layer.ssm_norm) { has_ssm_norm = true; break; }
+                    }
+                    if (!shard_groups && has_ssm_norm) {
+                        LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: n_group=%u not divisible by tp_size=%d but the "
+                            "model has a grouped ssm_norm — cannot split a group across ranks; refusing\n",
+                            __func__, n_group, tp.size);
+                        return {-2, nullptr};
+                    }
+                    hp.ssm_dt_rank  /= tp.size;
+                    hp.ssm_d_inner  /= tp.size;
+                    if (shard_groups) {
+                        hp.ssm_n_group /= tp.size;
+                    }
+                    LLAMA_LOG_INFO("%s: tensor parallelism: SSM sharded — local n_head=%u d_inner=%u "
+                        "n_group=%u (groups %s, tp_size=%d)\n", __func__, hp.ssm_dt_rank, hp.ssm_d_inner,
+                        hp.ssm_n_group, shard_groups ? "sharded" : "replicated", tp.size);
                 }
-                LLAMA_LOG_INFO("%s: tensor parallelism: SSM sharded — local n_head=%u d_inner=%u "
-                    "n_group=%u (groups %s, tp_size=%d)\n", __func__, hp.ssm_dt_rank, hp.ssm_d_inner,
-                    hp.ssm_n_group, repl_k ? "replicated (GDN k-heads)" :
-                    (shard_groups ? "sharded" : "replicated"), tp.size);
             }
 
             // Debug (LLAMA_TP_GDN_DEBUG): dump the GDN-relevant dims AFTER sharding divisions so we can
