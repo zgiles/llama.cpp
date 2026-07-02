@@ -1742,11 +1742,14 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     // CPU tensor parallelism: ffn_down is row-parallel (weight sharded on the contraction dim),
     // so each node holds a PARTIAL sum here. All-reduce across nodes to recover the full output.
-    // NOTE: in MoE expert-parallel mode (LLAMA_TP_MOE) build_ffn is used only for the SHARED expert,
-    // whose ffn_down is REPLICATED (not sharded) — all-reducing it would multiply it by size. So
-    // suppress the dense-FFN all-reduce in MoE mode. (Assumes pure-MoE models have no sharded dense
-    // FFN layers, which holds for qwen35moe et al.; the MoE combine is all-reduced in build_moe_ffn.)
-    if (down && llama_tp_enabled() && !llama_tp_moe_enabled()) {
+    // The SHARED expert's ffn_down is REPLICATED (never sharded), so all-reducing it would multiply it
+    // by tp_size. Only the sharded main dense FFN needs the reduction. Detect the shared expert by name
+    // (its tensors are "*_shexp") rather than by MoE mode: a MoE-hybrid model (qwen35moe) sharded via
+    // --tp-ssm/--tp-attn has MoE *disabled* but still has a replicated shared expert, which the old
+    // `!llama_tp_moe_enabled()` guard failed to suppress -> the shexp got double-counted -> garbage.
+    // (The MoE routed-expert combine is all-reduced separately in build_moe_ffn.)
+    const bool down_replicated = down && strstr(down->name, "shexp") != nullptr;
+    if (down && llama_tp_enabled() && !down_replicated) {
         cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
         cb(cur, "ffn_down_tp", il);
     }
