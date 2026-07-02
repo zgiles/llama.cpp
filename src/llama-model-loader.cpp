@@ -1680,6 +1680,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         tensor = ggml_new_tensor(ctx, cur->type, ggml_n_dims(cur), sne);
         ggml_set_name(tensor, ggml_get_name(cur));
         tp_plans[ggml_get_name(cur)] = tp_plan;
+        if (getenv("LLAMA_TP_GDN_DEBUG")) {
+            LLAMA_LOG_INFO("tp_shard: '%s' %s [%lld,%lld,%lld] -> [%lld,%lld,%lld]\n", ggml_get_name(cur),
+                ggml_type_name(cur->type), (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2],
+                (long long)tp_plan.ne0, (long long)tp_plan.ne1, (long long)tp_plan.ne2);
+        }
     } else if (tp_refused) {
         // fail loudly so the loader and graph stay consistent (and the user picks a valid TP size or
         // mode) rather than silently loading the full tensor.
