@@ -1,6 +1,34 @@
 #include "llama-tp-net.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+// Debug pass-through op: print a checksum of dst (F32) tagged with rank + dst->name. Gated by
+// LLAMA_TP_ATTN_DUMP so it costs nothing unless explicitly enabled. Insertion is also env-gated at
+// graph-build time, so in a normal run this is never even in the graph.
+void llama_tp_dump_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
+                      int ith, int nth, void * userdata) {
+    (void)a; (void)nth; (void)userdata;
+    if (ith != 0) return;
+    if (dst->type != GGML_TYPE_F32) return;
+    const float * x = (const float *) dst->data;
+    size_t n = (size_t) ggml_nelements(dst);
+    double sum = 0.0, sumsq = 0.0, amax = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double v = (double) x[i];
+        sum += v; sumsq += v * v;
+        double av = fabs(v); if (av > amax) amax = av;
+    }
+    int rank = llama_tp_rank();
+    fprintf(stderr,
+        "[TP_DUMP r%d] %-24s ne=[%lld,%lld,%lld,%lld] n=%zu sum=%.6f sumsq=%.6f absmax=%.6f "
+        "v0=%.5f v1=%.5f v2=%.5f\n",
+        rank, dst->name[0] ? dst->name : "(noname)",
+        (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3],
+        n, sum, sumsq, amax,
+        n > 0 ? x[0] : 0.0f, n > 1 ? x[1] : 0.0f, n > 2 ? x[2] : 0.0f);
+}
 
 // Process-wide CPU-TP config, set once from llama_model_params at model-load time
 // (llama_tp_set_config). Left at defaults (size <= 1), the accessors fall back to the legacy
