@@ -400,12 +400,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                         "tp_size=%d — refusing to shard SSM\n", __func__, n_head, d_inner, tp.size);
                     return {-2, nullptr};
                 }
-                const bool shard_groups = (n_group % tp.size == 0);
+                // Gated-delta-net (Qwen3-Next/3.5/3.5-MoE): its n_group == num_k_heads is a GQA sharing
+                // count coupled to the num_v_heads (n_head) via a MODULAR repeat (v-head p uses k-head
+                // p mod n_group). When n_group != n_head, the k-heads CANNOT be block-sharded to match a
+                // block v-head split — so keep them REPLICATED (the loader keeps the q,k projection
+                // segments full). Its ssm_norm is per-v-head (replicated), not grouped, so the grouped-
+                // norm guard below does not apply to GDN. When n_group == n_head, the pairing is identity
+                // and block-sharding groups is correct (as for Mamba-2).
+                const bool is_gdn =
+                    model->arch == LLM_ARCH_QWEN3NEXT ||
+                    model->arch == LLM_ARCH_QWEN35    ||
+                    model->arch == LLM_ARCH_QWEN35MOE;
+                const bool repl_k = is_gdn && (n_group != n_head);
+                const bool shard_groups = !repl_k && (n_group % tp.size == 0);
                 bool has_ssm_norm = false;
                 for (const auto & layer : model->layers) {
                     if (layer.ssm_norm) { has_ssm_norm = true; break; }
                 }
-                if (!shard_groups && has_ssm_norm) {
+                if (!shard_groups && has_ssm_norm && !is_gdn) {
                     LLAMA_LOG_ERROR("%s: LLAMA_TP_SSM: n_group=%u not divisible by tp_size=%d but the "
                         "model has a grouped ssm_norm — cannot split a group across ranks; refusing\n",
                         __func__, n_group, tp.size);
@@ -418,7 +430,24 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 }
                 LLAMA_LOG_INFO("%s: tensor parallelism: SSM sharded — local n_head=%u d_inner=%u "
                     "n_group=%u (groups %s, tp_size=%d)\n", __func__, hp.ssm_dt_rank, hp.ssm_d_inner,
-                    hp.ssm_n_group, shard_groups ? "sharded" : "replicated", tp.size);
+                    hp.ssm_n_group, repl_k ? "replicated (GDN k-heads)" :
+                    (shard_groups ? "sharded" : "replicated"), tp.size);
+            }
+
+            // Debug (LLAMA_TP_GDN_DEBUG): dump the GDN-relevant dims AFTER sharding divisions so we can
+            // check the recurrent-state cache sizing. n_embd_r/n_embd_s for gated-delta-net derive from
+            // n_head() (the ATTENTION head count) — which attn sharding divides — while the GDN mixer
+            // reshapes the state by ssm_dt_rank/ssm_d_inner. A mismatch = corrupt recurrent state.
+            if (getenv("LLAMA_TP_GDN_DEBUG")) {
+                const auto & hp = model->hparams;
+                LLAMA_LOG_INFO("%s: [GDN_DIM] attn(tp=%d ssm=%d) n_head=%u n_head_kv=%u kda=%u | "
+                    "ssm_dt_rank(v_heads)=%u ssm_d_inner=%u ssm_n_group(k_heads)=%u ssm_d_state=%u | "
+                    "n_embd_r=%u n_embd_s=%u | head_v_dim=%u state_reshape=%u\n",
+                    __func__, tp.attn, tp.ssm, hp.n_head_arr[0], hp.n_head_kv_arr[0], hp.n_embd_head_kda,
+                    hp.ssm_dt_rank, hp.ssm_d_inner, hp.ssm_n_group, hp.ssm_d_state,
+                    hp.n_embd_r(), hp.n_embd_s(),
+                    hp.ssm_dt_rank ? hp.ssm_d_inner / hp.ssm_dt_rank : 0,
+                    hp.ssm_dt_rank ? (hp.ssm_d_inner / hp.ssm_dt_rank) * (hp.ssm_d_inner / hp.ssm_dt_rank) * hp.ssm_dt_rank : 0);
             }
         }
 

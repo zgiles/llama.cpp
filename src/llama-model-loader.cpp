@@ -1342,25 +1342,41 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     const int64_t key_dim   = d_state * hp.ssm_n_group;   // per k-head-group key/query width
     const int64_t value_dim = hp.ssm_d_inner;             // = d_state * n_v_heads
 
+    // GDN GQA: the k-heads (num_k = ssm_n_group) are shared across v-heads (num_v = ssm_dt_rank) via a
+    // MODULAR pairing — the mixer ggml_repeat's q/k up to num_v, so v-head p uses k-head (p mod num_k)
+    // (ggml_repeat tiles). Splitting k-heads into contiguous blocks would give a rank the wrong k-heads
+    // for its v-heads. So when num_k != num_v, REPLICATE the k-side (q,k / conv q,k / a per-k-group
+    // beta|alpha), shard only the v-side; each rank then has all k-heads + its v slice -> num_k==num_v
+    // locally -> no repeat -> direct correct pairing. When num_k == num_v the pairing is identity and
+    // block-sharding both is correct (the validated qwen35-dense / Mamba-2 path).
+    const bool repl_k = (hp.ssm_n_group != n_v_heads);
+
     int64_t seg[3];
+    bool    seg_shard[3];   // per-segment: true = split across ranks, false = replicate (full on every rank)
     int     nseg = 0;
     int     axis;   // 1 = split ne[1] (2D weight rows); 0 = split ne[0] (1D vector)
     switch (t) {
-        case LLM_TENSOR_ATTN_QKV:                                 // [q|k|v]
-            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim; axis = 1; break;
+        case LLM_TENSOR_ATTN_QKV:                                 // [q|k|v]  (q,k are k-heads; v is v-heads)
+            seg[nseg] = key_dim;   seg_shard[nseg++] = !repl_k;
+            seg[nseg] = key_dim;   seg_shard[nseg++] = !repl_k;
+            seg[nseg] = value_dim; seg_shard[nseg++] = true; axis = 1; break;
         case LLM_TENSOR_SSM_CONV1D:                               // depthwise conv, channels [q|k|v]
-            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim;
+            seg[nseg] = key_dim;   seg_shard[nseg++] = !repl_k;
+            seg[nseg] = key_dim;   seg_shard[nseg++] = !repl_k;
+            seg[nseg] = value_dim; seg_shard[nseg++] = true;
             axis = ggml_n_dims(cur) >= 2 ? 1 : 0; break;
         case LLM_TENSOR_ATTN_GATE:                                // z gate [value_dim]
-            seg[nseg++] = value_dim; axis = 1; break;
-        case LLM_TENSOR_SSM_BETA_ALPHA:                           // per-k-group [beta|alpha] blocks,
-            seg[nseg++] = 2 * n_v_heads; axis = 1; break;         // contiguous by k-group (n_k % size == 0)
+            seg[nseg] = value_dim; seg_shard[nseg++] = true; axis = 1; break;
+        case LLM_TENSOR_SSM_BETA_ALPHA:                           // per-k-group [beta|alpha] blocks. This is
+            // k-group-structured (qwen3next); replicating k-heads while sharding it would desync the pairing.
+            if (repl_k) return -1;                                // unsupported combo -> refuse (don't corrupt)
+            seg[nseg] = 2 * n_v_heads; seg_shard[nseg++] = true; axis = 1; break;
         case LLM_TENSOR_SSM_BETA:                                 // {n_embd, n_v} per-v-head, separate
         case LLM_TENSOR_SSM_ALPHA:                                // beta/alpha (qwen35 / qwen35moe)
-            seg[nseg++] = n_v_heads; axis = 1; break;
+            seg[nseg] = n_v_heads; seg_shard[nseg++] = true; axis = 1; break;
         case LLM_TENSOR_SSM_DT:                                   // bias {n_v} (1D)
         case LLM_TENSOR_SSM_A_NOSCAN:                             // {n_v} (1D)
-            seg[nseg++] = n_v_heads; axis = 0; break;
+            seg[nseg] = n_v_heads; seg_shard[nseg++] = true; axis = 0; break;
         case LLM_TENSOR_SSM_IN:                                   // legacy fused [q|k|v|z] not supported
             return -1;
         default:
@@ -1375,8 +1391,13 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     int64_t run = 0, kept = 0;
     out->n_seg = 0;
     for (int i = 0; i < nseg; i++) {
-        if (seg[i] % size != 0) return -1;               // segment can't split evenly this many ways
-        const int64_t w = seg[i] / size, off = run + (int64_t) rank * w;
+        int64_t w, off;
+        if (seg_shard[i]) {
+            if (seg[i] % size != 0) return -1;           // segment can't split evenly this many ways
+            w = seg[i] / size; off = run + (int64_t) rank * w;
+        } else {
+            w = seg[i]; off = run;                       // replicated: every rank keeps the whole segment
+        }
         out->seg_src_off[out->n_seg] = (size_t) off * unit;
         out->seg_bytes[out->n_seg]   = (size_t) w   * unit;
         out->n_seg++;

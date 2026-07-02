@@ -333,6 +333,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
 
+    // CPU tensor parallelism: wo is row-parallel but applied manually here (gate must multiply in before
+    // wo, so wo=nullptr is passed to build_attn), bypassing build_attn's post-wo all-reduce. Add it back.
+    if (llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "attn_output_tp", il);
+    }
+
     return cur;
 }
 
