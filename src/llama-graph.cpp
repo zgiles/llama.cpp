@@ -2244,6 +2244,31 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
     }
 
+    // Debug (LLAMA_TP_ATTN_DUMP): checksum the attention output so the flash vs mul_mat paths can be
+    // compared for identical sharded inputs. build_attn_mha only runs for full-attention layers, so
+    // this fires ~n_layer/full_attn_interval times per token — grep by tag. Also dump q/k/v/mask meta.
+    if (getenv("LLAMA_TP_ATTN_DUMP")) {
+        fprintf(stderr,
+            "[TP_META r%d] l%d %s q ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] t=%d | "
+            "k ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] t=%d | "
+            "v ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] t=%d | "
+            "mask ne=[%lld,%lld,%lld,%lld] t=%d\n",
+            llama_tp_rank(), il, use_flash_attn ? "FA" : "MM",
+            (long long)q->ne[0],(long long)q->ne[1],(long long)q->ne[2],(long long)q->ne[3],
+            q->nb[0],q->nb[1],q->nb[2],q->nb[3], (int)q->type,
+            (long long)k->ne[0],(long long)k->ne[1],(long long)k->ne[2],(long long)k->ne[3],
+            k->nb[0],k->nb[1],k->nb[2],k->nb[3], (int)k->type,
+            (long long)v->ne[0],(long long)v->ne[1],(long long)v->ne[2],(long long)v->ne[3],
+            v->nb[0],v->nb[1],v->nb[2],v->nb[3], (int)v->type,
+            kq_mask ? (long long)kq_mask->ne[0]:0, kq_mask ? (long long)kq_mask->ne[1]:0,
+            kq_mask ? (long long)kq_mask->ne[2]:0, kq_mask ? (long long)kq_mask->ne[3]:0,
+            kq_mask ? (int)kq_mask->type : -1);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "attn_%s_l%d", use_flash_attn ? "fa" : "mm", il);
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_dump_op, 1, nullptr);
+        ggml_set_name(cur, nm);
+    }
+
     ggml_build_forward_expand(gf, cur);
 
     return cur;

@@ -138,6 +138,14 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
         }
 
+        // Debug (LLAMA_TP_ATTN_DUMP): per-layer mixer-output checksum, to compare sharded vs 1-socket.
+        if (getenv("LLAMA_TP_ATTN_DUMP")) {
+            char nm[32];
+            snprintf(nm, sizeof(nm), "mix_%s_l%d", hparams.is_recr(il) ? "R" : "A", il);
+            cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_dump_op, 1, nullptr);
+            ggml_set_name(cur, nm);
+        }
+
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
@@ -280,6 +288,13 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
     cb(cur, "attn_output", il);
+
+    // CPU tensor parallelism: wo is row-parallel but applied manually here (gate must multiply in before
+    // wo, so wo=nullptr is passed to build_attn), bypassing build_attn's post-wo all-reduce. Add it back.
+    if (llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "attn_output_tp", il);
+    }
 
     return cur;
 }

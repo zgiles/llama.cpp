@@ -1151,6 +1151,24 @@ static void tp_read_shard(llama_file * file, size_t offs, const tp_shard_plan & 
         }
         return;
     }
+    // Strided-row gather (gated-delta-net ssm_out): each output row contributes row_chunks strided
+    // chunks (the rank's v-head value channels, which are R runs at stride nk*head_v_dim in ne0).
+    if (pl.row_chunks > 1) {
+        size_t last = 0;
+        for (int c = 0; c < pl.row_chunks; c++) last = std::max(last, pl.row_chunk_off[c] + pl.chunk_bytes);
+        const size_t span = (size_t) (pl.nrows - 1) * pl.src_stride + last;
+        std::vector<uint8_t> buf(span);
+        file->seek(offs + pl.base_off, SEEK_SET);
+        file->read_raw(buf.data(), span);
+        size_t dst_off = 0;
+        for (int64_t r = 0; r < pl.nrows; r++) {
+            for (int c = 0; c < pl.row_chunks; c++) {
+                memcpy(dst + dst_off, buf.data() + (size_t) r * pl.src_stride + pl.row_chunk_off[c], pl.chunk_bytes);
+                dst_off += pl.chunk_bytes;
+            }
+        }
+        return;
+    }
     if (pl.nrows <= 1 || pl.src_stride == pl.chunk_bytes) {
         const size_t n = (pl.nrows <= 1) ? pl.chunk_bytes : (size_t) pl.nrows * pl.chunk_bytes;
         file->seek(offs + pl.base_off, SEEK_SET);
@@ -1331,30 +1349,79 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
                            const ggml_tensor * cur, tp_shard_plan * out) {
     if (!tp_is_gdn_arch(arch)) return 0;
     const int64_t d_state   = hp.ssm_d_state;
-    const int64_t n_v_heads = hp.ssm_dt_rank;
-    const int64_t key_dim   = d_state * hp.ssm_n_group;   // per k-head-group key/query width
-    const int64_t value_dim = hp.ssm_d_inner;             // = d_state * n_v_heads
+    const int64_t nk        = hp.ssm_n_group;             // num k-heads
+    const int64_t nv        = hp.ssm_dt_rank;             // num v-heads
+    const int64_t value_dim = hp.ssm_d_inner;             // = head_v_dim * nv
 
-    int64_t seg[3];
-    int     nseg = 0;
-    int     axis;   // 1 = split ne[1] (2D weight rows); 0 = split ne[0] (1D vector)
+    // GDN GQA: k-heads (num_k = ssm_n_group) are shared across v-heads (num_v = ssm_dt_rank) via a
+    // MODULAR pairing — the mixer ggml_repeat's q/k up to num_v, so v-head p uses k-head (p mod num_k).
+    // Shard by K-GROUP: rank r owns k-heads [r*nk_loc, (r+1)*nk_loc) plus the v-heads that pair to them,
+    // which are R = num_v/num_k STRIDED runs of nk_loc heads (runs at stride num_k in v-head index). This
+    // keeps the local ratio num_v_loc/num_k_loc == R (integer) on every rank, so the graph repeat and the
+    // fused op work unchanged. Requires num_k % size == 0 and num_v % num_k == 0 (also guarded in
+    // llama.cpp before load) — refuse here otherwise.
+    if (nk == 0 || nv == 0 || nk % size != 0 || nv % nk != 0) return -1;
+    const int64_t R      = nv / nk;
+    const int64_t nk_loc = nk / size;
+    const int64_t hv     = value_dim / nv;                // head_v_dim
+
+    // Two GDN head-pairing conventions decide how v-heads map to k-heads and thus how to shard:
+    //  - MODULAR (qwen35 / qwen35moe): the mixer tiles q/k so v-head p uses k-head (p mod num_k) — v-heads
+    //    are v-head-major, so this rank's v-heads are R STRIDED runs (stride num_k). Separate ssm_beta/alpha.
+    //  - BLOCK/interleave (qwen3next): the mixer repeat-interleaves so v-head p uses k-head (p / R) — v-heads
+    //    are k-group-major, so this rank's v-heads are ONE CONTIGUOUS run, ssm_out is a plain ROW split, and
+    //    beta/alpha are a single fused ssm_ba tensor laid out per-k-group ([beta(R)|alpha(R)] each k-head).
+    const bool block_pairing = (arch == LLM_ARCH_QWEN3NEXT);
+
+    // ssm_out (row-parallel {value_dim, n_embd}): its contraction dim ne0 = head_v_dim*num_v is v-head-
+    // structured. Block pairing -> the rank's v-heads are contiguous -> a plain contiguous ROW split works
+    // (fall through to tp_role_for_tensor). Modular -> R strided runs along ne0, gathered per output row.
+    if (t == LLM_TENSOR_SSM_OUT) {
+        if (block_pairing) return 0;   // contiguous ROW split via the generic path
+        const int64_t block = ggml_blck_size(cur->type);
+        if ((nk_loc*hv) % block != 0 || (nk*hv) % block != 0) return -1;   // runs must be block-aligned
+        out->n_seg      = 0;
+        out->row_chunks = (int) R;
+        out->chunk_bytes = ggml_row_size(cur->type, nk_loc*hv);
+        out->src_stride  = ggml_row_size(cur->type, cur->ne[0]);           // full ne0 row
+        out->base_off    = 0;
+        out->nrows       = cur->ne[1];
+        for (int64_t run = 0; run < R; run++) {
+            out->row_chunk_off[run] = (size_t) run  * ggml_row_size(cur->type, nk*hv)
+                                    + (size_t) rank * ggml_row_size(cur->type, nk_loc*hv);
+        }
+        out->ne0 = R*nk_loc*hv; out->ne1 = cur->ne[1]; out->ne2 = cur->ne[2];
+        out->total_bytes = (size_t) out->nrows * out->row_chunks * out->chunk_bytes;
+        return 1;
+    }
+
+    // The remaining tensors are ordered concatenations of per-head FIELDS. Each field is K-type (num_k
+    // heads) or V-type (num_v heads), with a per-head width in axis units. A K-field -> one contiguous
+    // slice of nk_loc heads; a V-field -> R strided runs of nk_loc heads (run r'th group of this rank's
+    // k-heads). phw = per-head width along the split axis.
+    struct field_t { int is_v; int64_t phw; };
+    field_t field[3];
+    int nf = 0;
+    int axis;   // 1 = split ne[1] (2D weight rows); 0 = split ne[0] (1D vector)
     switch (t) {
-        case LLM_TENSOR_ATTN_QKV:                                 // [q|k|v]
-            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim; axis = 1; break;
-        case LLM_TENSOR_SSM_CONV1D:                               // depthwise conv, channels [q|k|v]
-            seg[nseg++] = key_dim; seg[nseg++] = key_dim; seg[nseg++] = value_dim;
+        case LLM_TENSOR_ATTN_QKV:                          // [ q(k-heads) | k(k-heads) | v(v-heads) ]
+            field[nf++] = {0, d_state}; field[nf++] = {0, d_state}; field[nf++] = {1, hv}; axis = 1; break;
+        case LLM_TENSOR_SSM_CONV1D:                        // depthwise conv, channels [q|k|v]
+            field[nf++] = {0, d_state}; field[nf++] = {0, d_state}; field[nf++] = {1, hv};
             axis = ggml_n_dims(cur) >= 2 ? 1 : 0; break;
-        case LLM_TENSOR_ATTN_GATE:                                // z gate [value_dim]
-            seg[nseg++] = value_dim; axis = 1; break;
-        case LLM_TENSOR_SSM_BETA_ALPHA:                           // per-k-group [beta|alpha] blocks,
-            seg[nseg++] = 2 * n_v_heads; axis = 1; break;         // contiguous by k-group (n_k % size == 0)
-        case LLM_TENSOR_SSM_BETA:                                 // {n_embd, n_v} per-v-head, separate
-        case LLM_TENSOR_SSM_ALPHA:                                // beta/alpha (qwen35 / qwen35moe)
-            seg[nseg++] = n_v_heads; axis = 1; break;
-        case LLM_TENSOR_SSM_DT:                                   // bias {n_v} (1D)
-        case LLM_TENSOR_SSM_A_NOSCAN:                             // {n_v} (1D)
-            seg[nseg++] = n_v_heads; axis = 0; break;
-        case LLM_TENSOR_SSM_IN:                                   // legacy fused [q|k|v|z] not supported
+        case LLM_TENSOR_ATTN_GATE:                         // z gate [v-heads]
+            field[nf++] = {1, hv}; axis = 1; break;
+        case LLM_TENSOR_SSM_BETA:                          // {n_embd, n_v} per-v-head, separate
+        case LLM_TENSOR_SSM_ALPHA:                         // (qwen35 / qwen35moe)
+            field[nf++] = {1, 1}; axis = 1; break;
+        case LLM_TENSOR_SSM_DT:                            // bias {n_v} (1D)
+        case LLM_TENSOR_SSM_A_NOSCAN:                      // {n_v} (1D)
+            field[nf++] = {1, 1}; axis = 0; break;
+        case LLM_TENSOR_SSM_BETA_ALPHA:                    // qwen3next fused ssm_ba {n_embd, 2*num_v}: per
+            // k-head block of [beta(R)|alpha(R)] (k-group-major) -> shard contiguously by k-group, width 2R.
+            if (!block_pairing) return -1;                 // modular archs use separate ssm_beta / ssm_alpha
+            field[nf++] = {0, 2*R}; axis = 1; break;
+        case LLM_TENSOR_SSM_IN:                            // legacy fused [q|k|v|z] not supported
             return -1;
         default:
             return 0;
@@ -1365,16 +1432,32 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     if (axis == 0 && block != 1) return -1;   // 1D vectors are F32; can't slice a quant block by element
     const size_t unit = axis == 1 ? (size_t)(cur->ne[0] / block) * tsz : tsz;
 
-    int64_t run = 0, kept = 0;
-    out->n_seg = 0;
-    for (int i = 0; i < nseg; i++) {
-        if (seg[i] % size != 0) return -1;               // segment can't split evenly this many ways
-        const int64_t w = seg[i] / size, off = run + (int64_t) rank * w;
-        out->seg_src_off[out->n_seg] = (size_t) off * unit;
-        out->seg_bytes[out->n_seg]   = (size_t) w   * unit;
-        out->n_seg++;
-        kept += w;
-        run  += seg[i];
+    int64_t base = 0, kept = 0;
+    out->n_seg = 0; out->row_chunks = 0;
+    for (int f = 0; f < nf; f++) {
+        const int64_t phw = field[f].phw;
+        if (!field[f].is_v) {                              // K-field: one contiguous nk_loc-head slice
+            if (out->n_seg >= TP_MAX_SEG) return -1;
+            out->seg_src_off[out->n_seg] = (size_t)(base + (int64_t) rank * nk_loc * phw) * unit;
+            out->seg_bytes[out->n_seg]   = (size_t)(nk_loc * phw) * unit;
+            out->n_seg++; kept += nk_loc * phw;
+            base += nk * phw;
+        } else if (block_pairing) {                        // V-field, block: ONE contiguous nv_loc run
+            const int64_t nv_loc = R * nk_loc;
+            if (out->n_seg >= TP_MAX_SEG) return -1;
+            out->seg_src_off[out->n_seg] = (size_t)(base + (int64_t) rank * nv_loc * phw) * unit;
+            out->seg_bytes[out->n_seg]   = (size_t)(nv_loc * phw) * unit;
+            out->n_seg++; kept += nv_loc * phw;
+            base += nv * phw;
+        } else {                                           // V-field, modular: R strided runs of nk_loc heads
+            for (int64_t run = 0; run < R; run++) {
+                if (out->n_seg >= TP_MAX_SEG) return -1;
+                out->seg_src_off[out->n_seg] = (size_t)(base + (run*nk + (int64_t) rank*nk_loc) * phw) * unit;
+                out->seg_bytes[out->n_seg]   = (size_t)(nk_loc * phw) * unit;
+                out->n_seg++; kept += nk_loc * phw;
+            }
+            base += nv * phw;
+        }
     }
     out->total_bytes = (size_t) kept * unit;
     out->ne2 = cur->ne[2];
@@ -1382,8 +1465,9 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     else           { out->ne0 = kept;       out->ne1 = cur->ne[1]; }
     out->nrows = 0; out->chunk_bytes = 0; out->base_off = 0; out->src_stride = 0;
     if (getenv("LLAMA_TP_GDN_DEBUG")) {
-        LLAMA_LOG_INFO("tp_gdn: '%s' %s ne=[%lld,%lld] axis=%d unit=%zu nseg=%d ->", ggml_get_name(cur),
-            ggml_type_name(cur->type), (long long)cur->ne[0], (long long)cur->ne[1], axis, unit, out->n_seg);
+        LLAMA_LOG_INFO("tp_gdn: '%s' %s ne=[%lld,%lld] axis=%d unit=%zu R=%lld nseg=%d ->", ggml_get_name(cur),
+            ggml_type_name(cur->type), (long long)cur->ne[0], (long long)cur->ne[1], axis, unit,
+            (long long)R, out->n_seg);
         for (int i = 0; i < out->n_seg; i++) {
             LLAMA_LOG_INFO(" [off=%zu bytes=%zu]", out->seg_src_off[i], out->seg_bytes[i]);
         }
@@ -1625,7 +1709,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // CPU tensor parallelism: create this rank's SHARD of the tensor (smaller ne), and record
     // the load plan so load_data_for reads only the rank's slice from the GGUF.
     struct ggml_tensor * tensor = nullptr;
-    tp_shard_plan tp_plan;
+    tp_shard_plan tp_plan = {};   // zero-init: n_seg/row_chunks default off unless a plan builder sets them
     bool tp_sharded = false;
     bool tp_refused = false;          // a TP role applied but the shape can't be split this many ways
     const char * tp_why = "";

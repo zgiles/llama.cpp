@@ -25,6 +25,7 @@ int tp_shard_plan_make(tp_shard_role role, int rank, int size,
                        int64_t block, size_t type_size,
                        tp_shard_plan * out) {
     out->n_seg = 0;        // single-stride plan (not an SSM multi-segment gather)
+    out->row_chunks = 0;   // not a strided-row (gated-delta-net ssm_out) gather
     out->ne2 = ne2_full;   // unchanged except for EXPERT sharding
     if (size <= 1 || role == TP_SHARD_NONE) {
         out->ne0 = ne0_full; out->ne1 = ne1_full; out->nrows = ne1_full;
