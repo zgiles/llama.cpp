@@ -9542,6 +9542,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
 
+    // head_dim=256 with a single KV head (MQA) — the config CPU tensor-parallel sharding produces for
+    // qwen35moe (n_head_kv=2 -> 1). NOT covered by the loop above (nh==1 only runs for hsk 320/576),
+    // and empirically ggml_flash_attn_ext garbles it on CPU while the non-flash mha path is correct.
+    for (int nkv : { 1, 2, 4 }) {                  // 1 = sharded (suspect), 2/4 = unsharded (control)
+        for (int q_per_kv : { 8, 4 }) {
+            for (int kv : { 32, 80, 512 }) {       // small kv = the real prompt/decode length
+                for (int nb : { 1, 5, 8 }) {       // 1 = decode (one_chunk), 5 = short prefill, 8 = tiled
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, nkv, {q_per_kv, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
