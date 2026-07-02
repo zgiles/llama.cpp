@@ -43,8 +43,9 @@ typedef struct { int size; int rank; int enabled; int attn; int moe; tp_moe_mode
 // across ranks (expert parallelism): each rank holds n_expert/size experts.
 tp_shard_config tp_shard_from_env(void);
 
-// Max segments for an SSM concatenated-projection gather (z,x,B,C,dt = 5).
-#define TP_MAX_SEG 6
+// Max segments for a concatenated-projection or strided head gather. SSM ssm_in is 5 (z,x,B,C,dt);
+// gated-delta-net fused qkv is 2 k-fields + up-to-R v-runs, so allow generous headroom.
+#define TP_MAX_SEG 16
 
 // A load plan: `nrows` chunks of `chunk_bytes`, the i-th read from
 //   src: base_off + i*src_stride   ->   dst: i*chunk_bytes (contiguous).
@@ -61,6 +62,12 @@ typedef struct {
     int     n_seg;
     size_t  seg_src_off[TP_MAX_SEG]; // byte offset of each span in the source tensor data
     size_t  seg_bytes[TP_MAX_SEG];   // bytes copied from each span (sum == total_bytes)
+    // Strided-row gather (gated-delta-net ssm_out): when row_chunks>1 the rank's local ne0 for each
+    // of `nrows` output rows is the concatenation of `row_chunks` chunks of `chunk_bytes`, read from
+    // src offsets base_off + r*src_stride + row_chunk_off[c]. Used to gather the strided v-head value
+    // channels of a row-parallel weight whose v-heads are not a contiguous block on this rank.
+    int     row_chunks;
+    size_t  row_chunk_off[TP_MAX_SEG];
 } tp_shard_plan;
 
 // Compute the sharded shape + load plan. block = ggml_blck_size(type) (elements/block),
