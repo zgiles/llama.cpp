@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-tp-net.h"
 
 void llama_model_qwen3next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -526,6 +527,12 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     // Output projection
     cur = build_lora_mm(model.layers[il].ssm_out, final_output);
     cb(cur, "linear_attn_out", il);
+
+    // CPU tensor parallelism: ssm_out is row-parallel (each rank holds its v-heads' value_dim slice),
+    // so sum the per-rank partials into the full n_embd output before the residual add.
+    if (llama_tp_ssm_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+    }
 
     // Reshape back to original dimensions
     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);

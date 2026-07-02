@@ -197,9 +197,12 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = true;
+    // LLAMA_NO_FUSED_GDN forces the non-fused chunking/AR gated-delta-net path (debug: isolate the
+    // fused ggml_gated_delta_net op from the surrounding sharding).
+    const bool no_fused_gdn = getenv("LLAMA_NO_FUSED_GDN") != nullptr;
+    cparams.fused_gdn_ar = !no_fused_gdn;
+    cparams.fused_gdn_ch = !no_fused_gdn;
+    cparams.auto_fgdn    = !no_fused_gdn;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
