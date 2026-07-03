@@ -198,15 +198,6 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        // Debug (LLAMA_TP_ATTN_DUMP): checksum the mixer output per layer so the first layer that
-        // diverges between ssm-only and attn+ssm localizes the interaction bug. Tag: mix_R/mix_A.
-        if (getenv("LLAMA_TP_ATTN_DUMP")) {
-            char nm[32];
-            snprintf(nm, sizeof(nm), "mix_%s_l%d", hparams.is_recr(il) ? "R" : "A", il);
-            cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_dump_op, 1, nullptr);
-            ggml_set_name(cur, nm);
-        }
-
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
