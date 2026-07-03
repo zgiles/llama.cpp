@@ -49,12 +49,6 @@ int          llama_tp_port(void);
 void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
                            int ith, int nth, void * userdata);
 
-// Debug: ggml custom1 pass-through op that prints a checksum (count, sum, sumsq, absmax, first
-// values) of `dst` tagged with this rank and dst->name. Used to compare the attention output of
-// the flash vs mul_mat paths for identical sharded inputs. No-op unless LLAMA_TP_ATTN_DUMP is set.
-void llama_tp_dump_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
-                      int ith, int nth, void * userdata);
-
 #ifdef __cplusplus
 }
 #endif
