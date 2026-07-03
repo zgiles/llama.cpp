@@ -447,22 +447,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                         hp.ssm_n_group, shard_groups ? "sharded" : "replicated", tp.size);
                 }
             }
-
-            // Debug (LLAMA_TP_GDN_DEBUG): dump the GDN-relevant dims AFTER sharding divisions so we can
-            // check the recurrent-state cache sizing. n_embd_r/n_embd_s for gated-delta-net derive from
-            // n_head() (the ATTENTION head count) — which attn sharding divides — while the GDN mixer
-            // reshapes the state by ssm_dt_rank/ssm_d_inner. A mismatch = corrupt recurrent state.
-            if (getenv("LLAMA_TP_GDN_DEBUG")) {
-                const auto & hp = model->hparams;
-                LLAMA_LOG_INFO("%s: [GDN_DIM] attn(tp=%d ssm=%d) n_head=%u n_head_kv=%u kda=%u | "
-                    "ssm_dt_rank(v_heads)=%u ssm_d_inner=%u ssm_n_group(k_heads)=%u ssm_d_state=%u | "
-                    "n_embd_r=%u n_embd_s=%u | head_v_dim=%u state_reshape=%u\n",
-                    __func__, tp.attn, tp.ssm, hp.n_head_arr[0], hp.n_head_kv_arr[0], hp.n_embd_head_kda,
-                    hp.ssm_dt_rank, hp.ssm_d_inner, hp.ssm_n_group, hp.ssm_d_state,
-                    hp.n_embd_r(), hp.n_embd_s(),
-                    hp.ssm_dt_rank ? hp.ssm_d_inner / hp.ssm_dt_rank : 0,
-                    hp.ssm_dt_rank ? (hp.ssm_d_inner / hp.ssm_dt_rank) * (hp.ssm_d_inner / hp.ssm_dt_rank) * hp.ssm_dt_rank : 0);
-            }
         }
 
         return {0, model_ptr.release()};
