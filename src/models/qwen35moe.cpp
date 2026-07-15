@@ -683,6 +683,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
 
+    // CPU tensor parallelism: same as the main graphs -- wo is applied manually (gate before wo), so
+    // build_attn's post-wo all-reduce is bypassed and each rank holds only a PARTIAL. Add it explicitly
+    // so the MTP draft logits match across ranks (else divergent drafts -> rank desync/deadlock).
+    if (llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "mtp_attn_out_tp", il);
+    }
+
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
 

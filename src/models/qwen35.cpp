@@ -617,6 +617,13 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cur = build_lora_mm(layer.wo, cur, layer.wo_s);
     cb(cur, "mtp_attn_out", il);
 
+    // CPU tensor parallelism: manual wo (gate before wo) bypasses build_attn's post-wo all-reduce, so
+    // each rank holds a PARTIAL. Add it explicitly so MTP draft logits match across ranks.
+    if (llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "mtp_attn_out_tp", il);
+    }
+
     cur = ggml_add(ctx0, cur, inpSA);
     cb(cur, "mtp_attn_residual", il);
 
