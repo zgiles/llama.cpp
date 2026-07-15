@@ -95,6 +95,7 @@ int llama_tp_port(void) {
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -245,6 +246,35 @@ static int      g_nocomms  = 0;
 static uint64_t g_ar_calls = 0;   // number of all-reduce ops driven
 static uint64_t g_ar_ns    = 0;   // total ns spent in the exchange+sum
 static uint64_t g_ar_floats = 0;  // total floats reduced (for avg size)
+// size-bucketed exchange+sum time so the decode avg isn't polluted by big prefill reductions.
+static uint64_t g_ar_calls_dec = 0, g_ar_ns_dec = 0;
+static uint64_t g_ar_calls_pre = 0, g_ar_ns_pre = 0;
+
+// Cycle-accounting trace (LLAMA_TP_TRACE=<path>): one row per all-reduce call, dumped to
+// <path>.r<rank>.csv at exit. Joined offline across the two ranks by call index to split the
+// per-call cost into partner skew |D| (t_enter diff across ranks), protocol x (recv_done-enter on
+// the late rank) and sum s. t_enter_min/max are CAS'd by ALL threads (release-spread / wake).
+#define TP_TRACE_MAX 65536
+struct tp_trace_ent {
+    uint32_t n;
+    uint32_t _pad;
+    _Atomic uint64_t t_enter_min, t_enter_max;   // all-thread op entry
+    uint64_t t_enter;                            // thread 0 op entry (cross-rank |D| reference)
+    uint64_t t_post[4], t_send_done[4], t_recv_done[4], t_sum_done[4];
+};
+static struct tp_trace_ent * g_trace = NULL;
+static char     g_trace_path[256];
+static uint64_t g_trace_max = 0;
+static __thread uint64_t tls_seq = 0;            // per-thread call index (lockstep across threads)
+
+static inline void tr_cas_min(_Atomic uint64_t * p, uint64_t v) {
+    uint64_t o = atomic_load_explicit(p, memory_order_relaxed);
+    while (v < o && !atomic_compare_exchange_weak_explicit(p, &o, v, memory_order_relaxed, memory_order_relaxed)) {}
+}
+static inline void tr_cas_max(_Atomic uint64_t * p, uint64_t v) {
+    uint64_t o = atomic_load_explicit(p, memory_order_relaxed);
+    while (v > o && !atomic_compare_exchange_weak_explicit(p, &o, v, memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 static uint64_t now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -256,16 +286,67 @@ static void tp_print_stats(void) {
             "avg_floats=%llu  (%s)\n",
             (unsigned long long)g_ar_calls, g_ar_ns / 1e6, (g_ar_ns / 1e3) / (double)g_ar_calls,
             (unsigned long long)(g_ar_floats / g_ar_calls), g_nocomms ? "NOCOMMS" : "comms");
+    if (g_ar_calls_dec) {
+        fprintf(stderr, "llama-tp:   decode-bucket  (<=128KB): calls=%llu avg=%.2f us\n",
+                (unsigned long long)g_ar_calls_dec, (g_ar_ns_dec / 1e3) / (double)g_ar_calls_dec);
+    }
+    if (g_ar_calls_pre) {
+        fprintf(stderr, "llama-tp:   prefill-bucket ( >128KB): calls=%llu avg=%.2f us\n",
+                (unsigned long long)g_ar_calls_pre, (g_ar_ns_pre / 1e3) / (double)g_ar_calls_pre);
+    }
+}
+
+static void tp_trace_dump(void) {
+    if (!g_trace || !g_trace_path[0]) return;
+    char fn[320]; snprintf(fn, sizeof fn, "%s.r%d.csv", g_trace_path, llama_tp_rank());
+    FILE * f = fopen(fn, "w");
+    if (!f) return;
+    fprintf(f, "seq,n,enter,enter_min,enter_max,post0,send0,recv0,sum0,post1,send1,recv1,sum1\n");
+    for (uint64_t k = 1; k <= g_trace_max && k < TP_TRACE_MAX; k++) {
+        struct tp_trace_ent * e = &g_trace[k];
+        if (!e->t_enter) continue;
+        fprintf(f, "%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            (unsigned long long)k, e->n,
+            (unsigned long long)e->t_enter,
+            (unsigned long long)atomic_load_explicit(&e->t_enter_min, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&e->t_enter_max, memory_order_relaxed),
+            (unsigned long long)e->t_post[0], (unsigned long long)e->t_send_done[0],
+            (unsigned long long)e->t_recv_done[0], (unsigned long long)e->t_sum_done[0],
+            (unsigned long long)e->t_post[1], (unsigned long long)e->t_send_done[1],
+            (unsigned long long)e->t_recv_done[1], (unsigned long long)e->t_sum_done[1]);
+    }
+    fclose(f);
+    fprintf(stderr, "llama-tp: trace dumped to %s (%llu calls)\n", fn, (unsigned long long)g_trace_max);
 }
 
 void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
                            int ith, int nth, void * userdata) {
     (void)a; (void)nth; (void)userdata;
+    // Piece B: EVERY participating thread stamps op entry (before the thread-0 gate) so the arrival
+    // spread (barrier release / wake) is captured; tls_seq stays lockstep since every thread runs
+    // every AR node once between ggml barriers, giving a shared per-call index with no atomics.
+    const uint64_t seq = ++tls_seq;
+    if (g_trace && seq < TP_TRACE_MAX) {
+        const uint64_t t = now_ns();
+        tr_cas_min(&g_trace[seq].t_enter_min, t);
+        tr_cas_max(&g_trace[seq].t_enter_max, t);
+    }
     if (ith != 0) return;                       // single thread drives the UCX worker
     if (!g_init_done) {                          // lazy bootstrap on the worker thread, first call
         g_init_done = 1;
         g_time    = getenv("LLAMA_TP_TIME")    && atoi(getenv("LLAMA_TP_TIME"))    != 0;
         g_nocomms = getenv("LLAMA_TP_NOCOMMS") && atoi(getenv("LLAMA_TP_NOCOMMS")) != 0;
+        const char * trp = getenv("LLAMA_TP_TRACE");
+        if (trp && trp[0]) {
+            strncpy(g_trace_path, trp, sizeof(g_trace_path) - 1);
+            g_trace = (struct tp_trace_ent *) calloc(TP_TRACE_MAX, sizeof(struct tp_trace_ent));
+            if (g_trace) {
+                for (uint64_t i = 0; i < TP_TRACE_MAX; i++) {
+                    atomic_store_explicit(&g_trace[i].t_enter_min, (uint64_t)-1, memory_order_relaxed);
+                }
+                atexit(tp_trace_dump);
+            }
+        }
         if (g_time) atexit(tp_print_stats);
         if (llama_tp_size() > 1) {  // config (llama_model_params) or LLAMA_TP_* env fallback
             g_net = tp_net_init(llama_tp_rank(), llama_tp_size(), llama_tp_peer(), llama_tp_port());
@@ -275,6 +356,8 @@ void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * 
     float * buf = (float *) dst->data;
     size_t n = (size_t) ggml_nelements(dst);
     if (n > TP_TMP_FLOATS) { fprintf(stderr, "tp: count %zu too big\n", n); abort(); }
+    struct tp_trace_ent * e = (g_trace && seq < TP_TRACE_MAX) ? &g_trace[seq] : NULL;
+    if (e) { e->n = (uint32_t) n; e->t_enter = now_ns(); }
     const uint64_t t0 = g_time ? now_ns() : 0;
     if (!g_nocomms) {
         // recursive-doubling: log2(N) exchange+sum steps, distinct tag per step so a fast rank's
@@ -284,12 +367,22 @@ void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * 
             ucp_tag_t tag = TP_TAG + s;
             void * sreq = ucp_tag_send_nbx(g_net->eps[s], buf, n * sizeof(float), tag, &p);
             void * rreq = ucp_tag_recv_nbx(g_net->worker, g_net->tmp, n * sizeof(float), tag, (ucp_tag_t)-1, &p);
+            if (e && s < 4) e->t_post[s] = now_ns();
             wait_req(g_net->worker, sreq);
+            if (e && s < 4) e->t_send_done[s] = now_ns();
             wait_req(g_net->worker, rreq);
+            if (e && s < 4) e->t_recv_done[s] = now_ns();
             for (size_t i = 0; i < n; i++) buf[i] += g_net->tmp[i];
+            if (e && s < 4) e->t_sum_done[s] = now_ns();
         }
     }
-    if (g_time) { g_ar_ns += now_ns() - t0; g_ar_calls++; g_ar_floats += n; }
+    if (g_time) {
+        const uint64_t d = now_ns() - t0;
+        g_ar_ns += d; g_ar_calls++; g_ar_floats += n;
+        if (n * 4 <= (128u << 10)) { g_ar_ns_dec += d; g_ar_calls_dec++; }
+        else                       { g_ar_ns_pre += d; g_ar_calls_pre++; }
+    }
+    if (e) g_trace_max = seq;
 }
 
 #else  // no UCX: op is a no-op
