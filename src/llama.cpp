@@ -341,7 +341,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             const tp_shard_config tp = tp_shard_from_env();
             if (tp.attn) {
                 auto & hp = model->hparams;
-                const uint32_t nl = hp.n_layer();
+                // n_layer_all (not n_layer) so the nextn/MTP block(s) at index >= n_layer() also get
+                // their head counts divided: the loader shards their attn_k/attn_v weights by tensor
+                // name, so the MTP KV-cache alloc must use the sharded head count too (else the KV
+                // set_rows asserts full-width cache vs half-width k_cur under TP + speculative decode).
+                const uint32_t nl = hp.n_layer_all;
                 // MLA (DeepSeek) shards only the query heads; its single shared latent KV head
                 // (n_head_kv == 1, the compressed cache) stays replicated on every rank.
                 const bool is_mla = hp.is_mla();
