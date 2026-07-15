@@ -494,3 +494,46 @@ isolation (shard load per-rank base_off, sel_mm local ids, weight mask complemen
 combine mine+peer=sum, mul_mat_id) yet the composite fails — points to a subtle graph/scheduler
 issue. NEXT: pivot to a custom local-expert op (replaces remap+mask+3x mul_mat_id) which sidesteps
 the suspect chain and is the faster design anyway. Repro kept at hpc/mul_mat_id_repro.c.
+
+---
+(NOTE: the GDN sharding saga + perf June24-July02 lives in hpc/PERF_TRACKING.md and auto-memory; the
+narrative below resumes at the 2026-07-03/04 session.)
+
+## SESSION 2026-07-03/04 — cleanup, GPU-attn offload, GLM-5.2 deep-context, model survey
+
+### Track A — GDN-TP debug scaffolding stripped (commit 404be19a6)
+Removed the env-gated bring-up instrumentation now that GDN sharding is validated: llama_tp_dump_op
+(+LLAMA_TP_ATTN_DUMP inserts), the GDN_DIM print, LLAMA_NO_FUSED_GDN. Kept the fix + LLAMA_TP_GDN_DEBUG
+shard-plan logging. Compile-clean; coherence on tonto92 2-sock TOKEN-IDENTICAL (1-sock ref == full TP)
+for all 3 GDN archs (qwen35moe / qwen35-dense / qwen3next) on a haiku prompt. Fork cpu-tp fast-forwarded
+(2547bd428, author Zachary Giles, no trailer).
+
+### Track B — GPU-attention offload on the Intel B580 (tonto92), Vulkan
+Built Vulkan (build-vk; Mesa ANV out of the box; nix gotchas: pass Vulkan_INCLUDE_DIR/Vulkan_LIBRARY +
+-I<spirv-headers>/include since ggml-vulkan doesn't link SPIRV-Headers). GPU-attn = attention+KV on the
+B580, MoE experts on CPU (-ngl 99 -ncmoe 64). On qwen35moe 35B Q4: GPU-attn FLATTENS the long-context
+decode drop — CPU-only (repack) tg 9.84@d0 -> 6.19@d32K (-40%); GPU-attn 9.77 -> 7.33 (-11%); crossover
+~20K, GPU +18% at 32K. *** Gotcha: the Vulkan build DISABLES the AVX512-VNNI Q4_K repack -> its CPU path
+is ~half speed; use build-native (repack) for the honest CPU baseline. ***
+
+### GLM-5.2 deep-context / 1M goal — characterized, multi-node validated, prefill-walled
+GLM-5.2-REAP-504B-Q4_K_XL = arch glm-dsa (MLA compressed KV + DeepSeek Sparse Attention; llama.cpp has
+a REAL DSA impl: llama-kv-cache-dsa + indexer/top_k). 79 layers, 1M native ctx, 168 exp/8 used. RUNS
+coherently. CPU 1-node (Cascade -t48): pp 14.11@d0 -> 2.0@d32K; tg 1.30 -> 0.81. Powered on 121+124 via
+lab-manager (maple.zrg.cc=10.70.132.68:8098, reachable from northng ONLY by IP), built Skylake-native
+binaries, ran expert-TP over IB: 2-way pp 24.36/tg 1.57; 4-way rank=socket pp 16.92/tg 3.09 (2x decode,
+lower pp). *** 1M VERDICT: prefill is THE wall — ~O(ctx^2) dense compute, ~days for a fresh 1M context;
+GPU can't help (331 GB experts don't fit 12 GB); KV at 1M ~116 GB. Not practical on this cluster without
+GPU-accelerated prefill or a linear-attention model. *** Powered 121+124 back down after.
+
+### Model survey (mid-2026) + MiniMax-M2.7
+Web-checked current open-weight frontier: GLM-5.2 (top AA Intelligence Index but 504B/prefill-walled),
+Kimi K2.6/K2.7 (~1T, MLA, heavy), DeepSeek V4 Pro (no GGUF yet), MiniMax-M2.7 (near-frontier at only
+~10B active). Tested MiniMax-M2.7 Q8 (minimax-m2, 62L, 192K ctx, 256exp/8, FULL GQA attn) on tonto92
+CPU: fast-ish at d0 (pp 27.96 / tg 5.99) but decode COLLAPSES at depth (tg 0.56 @ d32K) — full-attention
+KV scan (~250 KiB/token). Q8 also caps decode (Q4 would ~2x). *** GPU-attn on M2.7 = NET LOSS: pp 2.71/
+tg 2.31 @d0, tg 1.54 @d8K, OOM @d32K (~10x slower prefill / 2x slower decode than CPU). Because it's
+Q8_0 (Battlemage ~4x slower than Q4_K) + per-layer GPU<->CPU shuttle + 12GB VRAM ceiling. The qwen35moe
+GPU-attn win needed Q4_K + GDN. *** LESSON: on CPU + 1x 12GB GPU, every full-attn/MLA frontier model collapses at
+deep context (GLM via prefill, M2.7 via decode); only linear/GDN attention (qwen3next; future MiniMax M3
+w/ sparse attn) stays flat. Deep context here wants a linear-attention model OR GPU-accelerated prefill.
