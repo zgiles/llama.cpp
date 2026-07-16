@@ -365,7 +365,11 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
                             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        // When the full-width post-output_norm hidden is requested for the MTP seed (glm-dsa draft
+        // head), keep every row through the last layer so t_h_nextn below covers all tokens.
+        const bool h_nextn_full = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+
+        if (il == n_layer - 1 && inp_out_ids && !h_nextn_full) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -424,6 +428,16 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    // MTP seed: the post-output_norm hidden feeds the glm-dsa NextN draft head. Only exposed when
+    // embeddings_nextn (unmasked) is requested; plain deepseek2/mistral4/ocr decode is unaffected.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    const bool h_nextn_full = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    if (h_nextn_full && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
