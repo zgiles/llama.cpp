@@ -169,6 +169,24 @@ x fewer bytes/pass) -> plausibly ~2.5-2.7x decode at full-model quality. This is
 "speed up frontier SOTA models" -- not comms/1M. *** GPU-for-MTP idea (user): low upside, draft already
 ~1-2% of a pass; aim a real GPU (5090) at the DSA indexer offload / KV instead.
 
+## Sub-2-bit quant (Unsloth IQ2_M) does NOT speed up CPU decode -- i-quant dequant is compute-bound (2026-07-16)
+
+Fable idea #1 was "sub-2-bit expert quant cuts active bytes/token -> ~2x decode" (bandwidth). Tested the
+official Unsloth GLM-5.2 UD-IQ2_M (full 744B, 2.7 bpw, 222 GiB) on tonto92 single-socket -t24:
+  REAP-Q4 (504B Q4_K) tg 2.29  vs  full-IQ2_M (754B, 2.7bpw) tg 1.85  -> IQ2 is 19% SLOWER, not ~2x faster.
+*** i-quants (IQ1/IQ2) use codebook/lookup dequant with NO AVX512-VNNI fast path (unlike Q4_K's
+scale+offset repack) -> reading fewer BYTES doesn't help when UNPACKING them costs more; decode becomes
+dequant-COMPUTE-bound, not bandwidth-bound. So sub-2-bit helps GPU/bandwidth-bound setups (its design
+target) but NOT our CPU-compute-bound box. *** (Confound: full 744B/256-exp vs REAP 504B/168-exp -- but
+the direction is clear.) Gotcha for future: check the quant's CPU dequant cost, not just bpw. Decisive
+confirm = perf record on the IQ2 decode (dequantize_row_iq2* dominating) or full-Q6-vs-full-IQ2 same-model
+A/B. Multi-socket makes it WORSE: IQ2 1-sock t24 1.85, 2-sock interleave t48 1.59 -> not ALU-compute-bound
+either; i-quant codebook dequant has poor locality + UPI penalty when spread. So sub-2-bit i-quants are
+a NET LOSS on this CPU and don't scale -> no point testing multinode IQ2. Note: llama-bench SUPPRESSES
+loader errors (2>/dev/null hides them) -- use llama-cli for load debug; and "N shards present" != download
+complete (shard 6 grew 3.9->39GB after; a mid-download tensor was "not within file bounds"). *** So the frontier-MoE decode win that HELD is MTP spec (+39%); the quant lever did
+NOT. Combined hope of ~2.5x was wrong -- MTP alone is the win on CPU. ***
+
 ## Machine-readable (for plotting)
 ```csv
 date,commit,model,hw,config,pp_ts,tg_ts,pp_base,tg_base,pp_speedup,tg_speedup
