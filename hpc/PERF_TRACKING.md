@@ -153,6 +153,22 @@ TP work); correctness verification (re-feed output, check greedy argmax) pending
 2 = the ONE code change (2-line all-reduce after manual wo in graph_mtp qwen35moe.cpp:683 + qwen35.cpp
 twin, matching the 3 main GDN graphs we already patched) -> MTP under 2-socket TP; then K sweep + multinode.
 
+## MTP speculative decode WIRED for glm-dsa / GLM-5.2 (2026-07-16) -- frontier-model decode win
+
+GLM-5.2's nextn/MTP tensors load in the GGUF but glm-dsa never computed them (loader TENSOR_SKIP'd
+blk.n_layer; no graph_mtp). Implemented it (commit: graph_mtp = eh_proj seed + deepseek2 MLA attn + MoE
+FFN + shared head; loader loads blk.78 when present; deepseek2 graph tail sets t_h_nextn gated;
+KV-filter for the MTP layer). Pre-gate: the REAP nextn weights are BIT-IDENTICAL to the full UD-Q6's
+(REAP didn't touch the MTP head). RESULT (GLM-5.2-REAP-504B, single-sock -t24, --spec-type draft-mtp):
+  ctrl 2.3 | **K=2 3.2 (+39%, PEAK)** | K=4 3.1 (+35%) | K=6 2.4 (+4%).
+tg tracks K -> CONFIRMED real spec (not a load confound). GLM's MTP alpha decays FASTER than qwen35moe's
+(peak K=2 vs qwen's K=6) -- single MTP head + REAP-pruned MTP-block experts. graph_mtp graph-reserve is
+CLEAN on the real 504B (MLA splice correct). *** So both frontier-MoE decode levers now proven on
+GLM-5.2: MTP spec +39% (this) and (pending) Unsloth IQ2_M 2-bit ~2x bandwidth -- they STACK (fewer passes
+x fewer bytes/pass) -> plausibly ~2.5-2.7x decode at full-model quality. This is the real answer to
+"speed up frontier SOTA models" -- not comms/1M. *** GPU-for-MTP idea (user): low upside, draft already
+~1-2% of a pass; aim a real GPU (5090) at the DSA indexer offload / KV instead.
+
 ## Machine-readable (for plotting)
 ```csv
 date,commit,model,hw,config,pp_ts,tg_ts,pp_base,tg_base,pp_speedup,tg_speedup
