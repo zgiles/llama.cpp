@@ -23,6 +23,11 @@
                 inputsFrom = [ package ];
                 shellHook = ''
                   echo "Entering ${name} devShell"
+                  # Allow -march=native: nixpkgs sets NIX_ENFORCE_NO_NATIVE=1 by default, which
+                  # silently strips -march=native from GGML_NATIVE builds -> generic no-AVX512/VNNI
+                  # binaries (much slower on CPU, and can invert perf results). We build for the
+                  # local host here, so opt back into native codegen.
+                  export NIX_ENFORCE_NO_NATIVE=0
                 '';
               };
               "${name}-extra" =
@@ -42,6 +47,8 @@
                     shellHook = ''
                       echo "Entering ${name} devShell"
                       addToSearchPath "LD_LIBRARY_PATH" "${lib.getLib stdenv.cc.cc}/lib"
+                      # See note above: opt back into -march=native for CPU-optimized builds.
+                      export NIX_ENFORCE_NO_NATIVE=0
                     '';
                   };
             }
