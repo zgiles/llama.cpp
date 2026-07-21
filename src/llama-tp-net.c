@@ -139,10 +139,19 @@ static int tcp_listen(int port) {
     listen(s, TP_MAXR); return s;
 }
 static int tcp_client(const char * ip, int port) {
+    // A single-node TP run leaves --tp-peer unset, so ip is NULL here; default to loopback.
+    // (Multi-node always passes rank 0's address.) inet_addr(NULL) would segfault otherwise.
+    if (!ip || !ip[0]) ip = "127.0.0.1";
     int s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a; memset(&a, 0, sizeof a);
     a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = inet_addr(ip);
-    for (int t = 0; connect(s, (void *)&a, sizeof a); t++) { if (t > 1200) return -1; usleep(100000); }
+    // The peer (rank 0, the listener) only opens this port once IT has finished loading the model and
+    // reached its first all-reduce. On a large model the ranks finish loading minutes apart, so the old
+    // 120 s cap made a fast client give up and run solo (silent garbage output). Retry generously
+    // (default 15 min; override via LLAMA_TP_CONNECT_SECS) to cover the inter-rank load skew.
+    const char * cs = getenv("LLAMA_TP_CONNECT_SECS");
+    const int max_t = (cs && atoi(cs) > 0 ? atoi(cs) : 900) * 10;   // usleep below is 100 ms per try
+    for (int t = 0; connect(s, (void *)&a, sizeof a); t++) { if (t > max_t) return -1; usleep(100000); }
     return s;
 }
 
