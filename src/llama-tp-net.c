@@ -394,11 +394,37 @@ void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * 
     if (e) g_trace_max = seq;
 }
 
-#else  // no UCX: op is a no-op
+// Binomial-tree broadcast from rank 0, reusing the recursive-doubling endpoints g_net->eps[s]
+// (eps[s] connects rank <-> rank^(1<<s)). Step s: ranks in [0,2^s) that already hold the data send
+// to their step-s partner (rank+2^s); ranks in [2^s,2^(s+1)) receive; after log2(N) steps everyone
+// has it. Distinct tag from the all-reduce (TP_TAG) — and broadcasts run between decodes, never
+// concurrently with an all-reduce — so there is no tag collision. Payload is tiny (a token id), so a
+// plain send/recv per step is cheap. Runs on the same (thread-0) UCX worker as the all-reduce.
+#define TP_TAG_BCAST 0x7B10
+
+void llama_tp_bcast(void * buf, size_t nbytes) {
+    if (!g_net || g_net->size < 2 || nbytes == 0) return;
+    const int rank = g_net->rank;
+    for (int s = 0; s < g_net->nsteps; s++) {
+        const int mask = 1 << s;
+        ucp_request_param_t p; p.op_attr_mask = 0;
+        if (rank < mask) {                          // already have data -> send to eps[s] (rank + mask)
+            void * req = ucp_tag_send_nbx(g_net->eps[s], buf, nbytes, (ucp_tag_t)TP_TAG_BCAST, &p);
+            wait_req(g_net->worker, req);
+        } else if (rank < (mask << 1)) {            // receive the data this step (from rank - mask)
+            void * req = ucp_tag_recv_nbx(g_net->worker, buf, nbytes, (ucp_tag_t)TP_TAG_BCAST, (ucp_tag_t)-1, &p);
+            wait_req(g_net->worker, req);
+        }
+    }
+}
+
+#else  // no UCX: ops are no-ops
 
 void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
                            int ith, int nth, void * userdata) {
     (void)dst; (void)a; (void)ith; (void)nth; (void)userdata;
 }
+
+void llama_tp_bcast(void * buf, size_t nbytes) { (void)buf; (void)nbytes; }
 
 #endif // LLAMA_TP_UCX
