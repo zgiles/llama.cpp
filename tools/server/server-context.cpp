@@ -1272,7 +1272,8 @@ private:
         }
 
         if (spec) {
-            SRV_TRC("%s", "speculative decoding context initialized\n");
+            SRV_INF("speculative decoding context initialized (types: %s)\n",
+                    common_speculative_type_name_str(params_base.speculative.types).c_str());
         } else {
             spec_init.reset();
             ctx_dft   = nullptr;
@@ -4601,6 +4602,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
 
     task_params tparams;
     tparams.sampling = params.sampling;
+    tparams.speculative = params.speculative; // so /props reflects the server's actual spec config (not the default "none")
     json default_generation_settings_for_props = json {
         { "params", tparams.to_json(true) },
         { "n_ctx",  meta.slot_n_ctx },
