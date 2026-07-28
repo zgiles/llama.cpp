@@ -1535,6 +1535,15 @@ extern "C" {
     // Print system information
     LLAMA_API const char * llama_print_system_info(void);
 
+    // CPU tensor parallelism: broadcast `nbytes` from rank 0 to all other ranks over the TP
+    // transport (binomial tree on the existing all-reduce endpoints). Used to make rank 0 the
+    // authoritative sampler — it broadcasts the chosen next-token id each decode step so all ranks
+    // stay in lockstep at ANY sampling temperature (independent per-rank sampling would diverge and
+    // deadlock the per-layer all-reduce). No-op when TP is inactive (size <= 1) or the transport
+    // isn't up yet, and in builds without UCX. Must be called from the same thread that drives the
+    // all-reduce (the main/generation thread == ggml thread 0). Root is always rank 0.
+    LLAMA_API void llama_tp_broadcast(void * data, size_t nbytes);
+
     // Set callback for all future logging events.
     // If this is not called, or NULL is supplied, everything is output on stderr.
     // The logger state is global so these functions are NOT thread safe.

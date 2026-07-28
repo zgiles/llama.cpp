@@ -706,7 +706,19 @@ int llama_completion(int argc, char ** argv) {
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
-            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            llama_token id = common_sampler_sample(smpl, ctx, -1);
+
+            // CPU tensor parallelism: rank 0 is the authoritative sampler. Broadcast its chosen
+            // token so every rank feeds the SAME next token and stays in lockstep at ANY sampling
+            // temperature. Without this, temp>0 makes the ranks sample different tokens, diverge in
+            // length, and one rank hits EOG and exits while the other blocks forever on the per-layer
+            // all-reduce (the confirmed TP deadlock). At temp 0 all ranks already sample identically,
+            // so this is a harmless no-op; it is also a no-op when TP is off or the transport is down.
+            if (params.tp_size > 1) {
+                int32_t tp_tok = id;
+                llama_tp_broadcast(&tp_tok, sizeof(tp_tok));   // root = rank 0
+                id = tp_tok;
+            }
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 

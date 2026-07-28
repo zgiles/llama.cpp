@@ -706,3 +706,11 @@ const char * llama_print_system_info(void) {
     return s.c_str();
 }
 
+// Public wrapper (exported via LLAMA_API in llama.h) over the internal TP broadcast in
+// llama-tp-net.c. Lets the generation loop make rank 0 the authoritative sampler: it broadcasts the
+// chosen token id each step so all ranks stay in lockstep at any sampling temperature. No-op when TP
+// is inactive or in non-UCX builds.
+void llama_tp_broadcast(void * data, size_t nbytes) {
+    llama_tp_bcast(data, nbytes);
+}
+

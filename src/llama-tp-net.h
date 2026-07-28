@@ -49,6 +49,13 @@ int          llama_tp_port(void);
 void llama_tp_allreduce_op(struct ggml_tensor * dst, const struct ggml_tensor * a,
                            int ith, int nth, void * userdata);
 
+// Broadcast `nbytes` from rank 0 to all ranks over the TP transport (binomial tree on the
+// existing recursive-doubling endpoints). Used by the rank-0-authoritative sampler to keep ranks
+// in lockstep at any temperature. No-op if the transport isn't up (g_net NULL / size <= 1) or in
+// non-UCX builds. Called from the generation thread (== ggml thread 0, which owns the UCX worker).
+// The public llama_tp_broadcast() (llama.h) wraps this.
+void llama_tp_bcast(void * buf, size_t nbytes);
+
 #ifdef __cplusplus
 }
 #endif
