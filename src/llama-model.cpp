@@ -2073,12 +2073,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
             {
-                if (arch == LLM_ARCH_GLM_DSA && hparams.n_layer_nextn > 0 &&
-                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                const bool glm_dsa_mtp = arch == LLM_ARCH_GLM_DSA && hparams.n_layer_nextn > 0 &&
+                        params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                // LLAMA_GLM_DSA_DENSE: run glm-dsa as plain dense MLA (no lightning indexer). The main
+                // (non-MTP) context then needs a plain KV cache filtered to the main layers instead of
+                // the dsa cache, mirroring the MTP plain-cache mechanism (build_attn_inp_k static_casts
+                // the mctx to llama_kv_cache_context).
+                const bool glm_dsa_dense_main = arch == LLM_ARCH_GLM_DSA &&
+                        getenv("LLAMA_GLM_DSA_DENSE") != nullptr &&
+                        params.ctx_type != LLAMA_CONTEXT_TYPE_MTP;
+
+                if (glm_dsa_mtp || glm_dsa_dense_main) {
                     // The GLM-5.2 MTP draft head uses plain (non-DSA) MLA attention with a K-only
                     // attention input, so give the MTP context a plain KV cache filtered to the
                     // NextN block instead of a dsa cache (build_attn_inp_k() static_casts the mctx).
-                    llama_kv_cache::layer_filter_cb filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    // The dense-fallback main context uses the same plain cache, but filtered to the
+                    // main layers (il < n_layer) instead of the NextN block.
+                    llama_kv_cache::layer_filter_cb filter = glm_dsa_mtp
+                            ? (llama_kv_cache::layer_filter_cb) [&](uint32_t il) { return il >= hparams.n_layer(); }
+                            : (llama_kv_cache::layer_filter_cb) [&](uint32_t il) { return il <  hparams.n_layer(); };
                     res = new llama_kv_cache(
                             *this,
                             hparams,

@@ -241,7 +241,19 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    llm_graph_input_attn_k_dsa * inp_attn_dsa = build_attn_inp_k_dsa();
+    // LLAMA_GLM_DSA_DENSE: skip the (slow) DSA lightning indexer and run plain dense MLA, exactly
+    // like graph_mtp does (plain K-only attention input + plain build_attn overload, no top_k). The
+    // plain-cache side of this is wired up in llama_model::create_memory. When unset, the upstream
+    // DSA indexer path below is used unchanged.
+    const bool dsa_dense = getenv("LLAMA_GLM_DSA_DENSE") != nullptr;
+
+    llm_graph_input_attn_k_dsa * inp_attn_dsa = nullptr;
+    llm_graph_input_attn_k     * inp_attn     = nullptr;
+    if (dsa_dense) {
+        inp_attn = build_attn_inp_k();
+    } else {
+        inp_attn_dsa = build_attn_inp_k_dsa();
+    }
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
@@ -269,7 +281,9 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
             ggml_tensor * top_k = nullptr;
 
-            // lightning indexer
+            // lightning indexer (skipped entirely in the LLAMA_GLM_DSA_DENSE fallback: top_k stays
+            // null and the plain build_attn overload below attends to all keys)
+            if (!dsa_dense) {
             if (hparams.is_indexer_full(il)) {
                 // "full" layer
                 ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
@@ -408,6 +422,7 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 top_k = prev_top_k;
                 cb(top_k, "top_k", il);
             }
+            } // if (!dsa_dense)
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
             cb(q, "q", il);
@@ -482,9 +497,17 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
                 cb(Vcur, "Vcur", il);
 
                 // note: MLA with the absorption optimization converts into MQA (ie: GQA with 1 group)
-                cur = build_attn(inp_attn_dsa,
-                        model.layers[il].wo, NULL, model.layers[il].wo_s,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
+                if (dsa_dense) {
+                    // plain dense MLA: same as graph_mtp (plain build_attn overload, no top_k). The
+                    // TP wo all-reduce is handled inside this overload, same as the DSA one.
+                    cur = build_attn(inp_attn,
+                            model.layers[il].wo, NULL, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, kq_scale, il);
+                } else {
+                    cur = build_attn(inp_attn_dsa,
+                            model.layers[il].wo, NULL, model.layers[il].wo_s,
+                            Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
+                }
             }
         }
         if (il == n_layer - 1 && inp_out_ids && !h_nextn_full) {
