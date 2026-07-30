@@ -14,6 +14,8 @@
 #include "common.h"
 #include "llama.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -110,6 +112,12 @@ int main(int argc, char ** argv) {
     int n_total = 0;
     std::string out;
 
+    // per-context single-token decode timing (the cost that matters for spec-decode)
+    double t_tgt = 0.0;
+    std::vector<double> t_dft(ctx_dft.size(), 0.0);
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+
     for (int i = 0; i < params.n_predict; ++i) {
         const llama_token tgt = argmax(llama_get_logits_ith(ctx_tgt, -1), n_vocab);
         for (size_t d = 0; d < ctx_dft.size(); ++d) {
@@ -125,11 +133,15 @@ int main(int argc, char ** argv) {
             break;
         }
 
-        // advance target and all drafts along the TARGET's greedy trajectory
+        // advance target and all drafts along the TARGET's greedy trajectory (timed)
         llama_token tok = tgt;
+        auto a = now();
         bool ok = llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1)) == 0;
+        auto b = now(); t_tgt += secs(a, b);
         for (size_t d = 0; d < ctx_dft.size() && ok; ++d) {
+            auto c = now();
             ok = llama_decode(ctx_dft[d], llama_batch_get_one(&tok, 1)) == 0;
+            auto e = now(); t_dft[d] += secs(c, e);
         }
         if (!ok) { fprintf(stderr, "%s: decode failed at step %d\n", __func__, i); break; }
 
@@ -145,19 +157,27 @@ int main(int argc, char ** argv) {
 
     // Greedy spec-decode expected accepted tokens per verify pass, chain length K,
     // per-token acceptance p:  E = (1 - p^(K+1)) / (1 - p).
-    printf("\n==== self-spec acceptance (target n_expert_used = model default) ====\n");
+    // Projected end-to-end speedup vs plain target decode:
+    //   speedup = E / (K * (c_draft/c_target) + 1),  c ratio = t_dft/t_tgt (measured).
+    const double tgt_tps = n_total ? n_total / t_tgt : 0.0;
+    printf("\n==== self-spec acceptance + cost (target n_expert_used = model default) ====\n");
     printf("tokens compared     : %d\n", n_total);
-    printf("%-8s %-10s %-10s  expected target-tokens/verify at K=\n", "draft", "accepted", "rate");
-    printf("%-8s %-10s %-10s  %6s %6s %6s %6s\n", "experts", "", "", "2", "4", "6", "8");
+    printf("target decode       : %.3f t/s  (%.3f s/tok)\n", tgt_tps, t_tgt / std::max(1, n_total));
+    printf("%-7s %-6s %-8s %-7s   projected end-to-end speedup at K=\n", "draft", "acc", "draft", "cost");
+    printf("%-7s %-6s %-8s %-7s   %6s %6s %6s %6s\n", "expert", "rate", "t/s", "ratio", "2", "4", "6", "8");
     for (size_t d = 0; d < ctx_dft.size(); ++d) {
-        const double acc = n_total ? (double) n_accept[d] / n_total : 0.0;
-        printf("%-8d %-10d %-9.1f%%", draft_counts[d], n_accept[d], 100.0 * acc);
+        const double acc   = n_total ? (double) n_accept[d] / n_total : 0.0;
+        const double dtps  = n_total ? n_total / t_dft[d] : 0.0;
+        const double cr    = t_tgt > 0 ? t_dft[d] / t_tgt : 0.0; // c_draft / c_target
+        printf("%-7d %-5.0f%% %-8.3f %-7.3f  ", draft_counts[d], 100.0 * acc, dtps, cr);
         for (int K : {2, 4, 6, 8}) {
-            double e = (acc >= 1.0) ? (K + 1) : (1.0 - std::pow(acc, K + 1)) / (1.0 - acc);
-            printf(" %6.2f", e);
+            double e  = (acc >= 1.0) ? (K + 1) : (1.0 - std::pow(acc, K + 1)) / (1.0 - acc);
+            double sp = e / (K * cr + 1.0);
+            printf(" %6.2f", sp);
         }
         printf("\n");
     }
+    printf("(speedup > 1.0 means spec-decode beats plain decode; cost ratio near 1.0 => draft not cheap enough)\n");
     printf("\noutput preview: %.200s\n", out.c_str());
 
     for (llama_context * c : ctx_dft) llama_free(c);
