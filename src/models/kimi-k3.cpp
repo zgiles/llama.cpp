@@ -615,7 +615,7 @@ ggml_tensor * llama_model_kimi_k3::graph::build_latent_moe(
         layer.ffn_down_exps,
         layer.ffn_exp_probs_b,
         hparams.n_expert,
-        hparams.n_expert_used,
+        n_expert_used, // graph-context member honours the per-context override (self-speculative draft)
         LLM_FFN_SITU, hparams.expert_weights_norm,
         hparams.expert_weights_scale,
         (llama_expert_gating_func_type) hparams.expert_gating_func,
