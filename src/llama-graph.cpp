@@ -2191,26 +2191,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     assert(n_expert_used > 0);
 
+    // `experts` has exactly `n_expert_used` slices (the graph value). Normally that equals
+    // hparams.n_expert_used; during warmup it is larger (= n_expert) and we intentionally cap the
+    // aggregation at hparams.n_expert_used to avoid a huge number of add nodes (ref PR#14753); with a
+    // per-context override (self-speculative draft) it can be SMALLER, so cap at the min of the two —
+    // else the views below overrun `experts`.
+    const uint32_t n_agg = (n_expert_used < (int64_t) hparams.n_expert_used)
+                         ? (uint32_t) n_expert_used : hparams.n_expert_used;
+
     // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 0; i < n_agg; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
     // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+    for (uint32_t i = 1; i < n_agg; ++i) {
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
-    if (hparams.n_expert_used == 1) {
+    if (n_agg == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }
