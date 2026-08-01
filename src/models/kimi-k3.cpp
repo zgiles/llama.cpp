@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include "llama-memory-recurrent.h"
+#include "llama-tp-net.h"
 
 //
 // Kimi-K3 text model: hybrid KDA (linear) + MLA (full) attention, as in kimi-linear.
@@ -475,6 +476,14 @@ ggml_tensor * llama_model_kimi_k3::graph::build_kda_layer(
     cur   = ggml_mul_mat(ctx0, layer.wo, gated);
     cb(cur, "kda_out", il);
 
+    // CPU tensor parallelism (--tp-attn): the KDA heads are sharded across ranks, so wo is
+    // row-parallel and this rank's cur is a partial sum over its local heads. All-reduce to the
+    // full n_embd output. (No build_attn here to do it.)
+    if (llama_tp_attn_enabled()) {
+        cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
+        cb(cur, "kda_out_tp", il);
+    }
+
     return cur;
 }
 
@@ -558,6 +567,14 @@ ggml_tensor * llama_model_kimi_k3::graph::build_mla_layer(
 
     out = ggml_mul_mat(ctx0, layer.wo, out);
     cb(out, "mla_out", il);
+
+    // CPU tensor parallelism (--tp-attn): the MLA query heads are sharded; the gate must multiply in
+    // before wo, so wo=nullptr was passed to build_attn (bypassing its post-wo all-reduce). wo is
+    // row-parallel here → this rank's out is a partial sum. All-reduce it back to full n_embd.
+    if (llama_tp_attn_enabled()) {
+        out = ggml_map_custom1_inplace(ctx0, out, llama_tp_allreduce_op, 1, nullptr);
+        cb(out, "mla_out_tp", il);
+    }
 
     return out;
 }
