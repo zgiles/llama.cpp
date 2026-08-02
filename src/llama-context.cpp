@@ -108,6 +108,11 @@ llama_context::llama_context(
     }
 
     cparams.n_expert_used           = params.n_expert_used;
+    // Env override so any tool (e.g. llama-cli) can run the model at a reduced active-expert count
+    // without a dedicated CLI flag — a quality/speed dial for MoE decode (LLAMA_N_EXPERT_USED=8).
+    if (const char * e = getenv("LLAMA_N_EXPERT_USED")) {
+        cparams.n_expert_used = (uint32_t) atoi(e);
+    }
     if (cparams.n_expert_used > hparams.n_expert_used) {
         LLAMA_LOG_WARN("%s: n_expert_used override (%u) > model n_expert_used (%u); ignoring override\n",
                        __func__, cparams.n_expert_used, hparams.n_expert_used);
