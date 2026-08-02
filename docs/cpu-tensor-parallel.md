@@ -88,6 +88,7 @@ Rank 0 acts as a TCP rendezvous point for exchanging UCX addresses at startup (`
 | Dense FFN (`ffn_gate`/`ffn_up` column-parallel, `ffn_down` row-parallel) | always (when TP enabled) | intermediate dim `n_ff` |
 | Attention (`wq`/`wk`/`wv` column, `wo` row) | `LLAMA_TP_ATTN=1` | heads |
 | MLA attention (DeepSeek: `wq_b` column, `wk_b`/`wv_b` per-head, `wo` row) | `LLAMA_TP_ATTN=1` | query heads |
+| Kimi-K3 hybrid attention — KDA delta-net (`wq`/`wk`/`wv` + `ssm_beta`/`ssm_f_b`/`ssm_g` column, `ssm_conv` per-head, `wo` row) and MLA layers | `LLAMA_TP_ATTN=1` | heads (KDA state shards with them) |
 | Recurrent SSM / Mamba-2 mixer (`ssm_in` column, scan per-head, `ssm_out` row) | `LLAMA_TP_SSM=1` | SSM heads / `d_inner` |
 | MoE routed experts | `LLAMA_TP_MOE=ep\|tp` | see [MoE parallel modes](#moe-parallel-modes) |
 
@@ -278,6 +279,23 @@ DeepSeek-V3.1 (256 experts × `n_ff` 2048 — *medium*):
 | ep (expert) | 2 | 11.9 | 2.70 |
 | tp (tensor) | 4 | **18.9** | 3.00 |
 
+Kimi-K3 (2.78 T; hybrid KDA-delta-net + MLA attention, 896 experts, Q2_K), `ep` (expert-parallel) with and
+without attention sharding (`LLAMA_TP_ATTN=1`):
+
+| config | ranks | pp | tg |
+|---|---|---|---|
+| ep (attention replicated) | 2 | 4.2 | 1.3 |
+| ep **+ `tp-attn`** | 2 | 4.8 | **1.6** |
+| ep (attention replicated) | 4 | 3.9 | 1.0 |
+| ep **+ `tp-attn`** | 4 | **5.9** | **2.0** |
+
+**K3 decode is ~⅘ attention** (the trunk weights are read every token, while only 16/896 experts fire). With
+attention *replicated*, adding ranks does nothing for that dominant cost — decode actually *regresses* 2→4
+ranks (1.3 → 1.0) as expert-parallel imbalance grows. With `tp-attn` the attention (both the KDA delta-net
+heads and the MLA heads) shards too, so decode **scales**: 1.6 → 2.0 going 2 → 4 ranks — 2× the
+attention-replicated 4-rank number, and 4× the naive single-process baseline. This is the case where
+`tp-attn` matters most.
+
 Takeaways:
 
 * **Pin to NUMA domains.** The naive 2-socket process (S2) is *less than half* the decode of a single
@@ -300,6 +318,10 @@ Takeaways:
 * **Hybrid models** (e.g. Mamba/SSM + MoE such as `nemotron_h_moe`) only have their MoE-FFN layers
   sharded; the SSM and attention layers are replicated on every rank. TP runs correctly but only pays off
   if the MoE-FFN is the bottleneck — for SSM/attention-dominated hybrids those layers must also be sharded.
+  **Exception: Kimi-K3** — its hybrid KDA (delta-net) + MLA attention *is* fully sharded under
+  `LLAMA_TP_ATTN=1` (the KDA recurrent state shards with the heads, since it is sized from `n_head`), which
+  is what lets its attention-dominated decode scale across ranks (see [Indicative results](#indicative-results)).
+  Gated-delta-net attention in other archs (Qwen3-Next/3.5) shards under `LLAMA_TP_SSM=1` instead.
 * Both gated (SwiGLU, `gate`+`up`+`down`) and non-gated (`up`+`down`, e.g. relu²) MoEs are supported.
 
 ## Glossary
