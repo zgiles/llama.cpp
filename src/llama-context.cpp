@@ -107,6 +107,17 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    cparams.n_expert_used           = params.n_expert_used;
+    if (cparams.n_expert_used > hparams.n_expert_used) {
+        LLAMA_LOG_WARN("%s: n_expert_used override (%u) > model n_expert_used (%u); ignoring override\n",
+                       __func__, cparams.n_expert_used, hparams.n_expert_used);
+        cparams.n_expert_used = 0;
+    }
+    if (cparams.n_expert_used > 0 && cparams.n_expert_used != hparams.n_expert_used) {
+        LLAMA_LOG_INFO("%s: MoE active experts overridden: %u (model default %u) — self-speculative draft context\n",
+                       __func__, cparams.n_expert_used, hparams.n_expert_used);
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -2336,6 +2347,7 @@ void llama_context::output_reorder() {
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
+        model.arch == LLM_ARCH_KIMI_K3 ||
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
@@ -3472,6 +3484,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
+        /*.n_expert_used               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

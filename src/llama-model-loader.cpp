@@ -1111,6 +1111,16 @@ static tp_shard_role tp_role_for_tensor(llm_arch arch, llm_tensor t, int attn, i
         case LLM_TENSOR_ATTN_K_B:
         case LLM_TENSOR_ATTN_V_B:
             return attn ? TP_SHARD_EXPERT : TP_SHARD_NONE;
+        // Fused MLA kv_b {kv_lora, n_head*(nope+v)} (when wk_b/wv_b are absent) -> COLUMN by head
+        // (the even ne1 split lands on head boundaries). Without this it would load full-width while the
+        // graph views it with the sharded n_head -> silently wrong output on rank>0.
+        case LLM_TENSOR_ATTN_KV_B:
+            return attn ? TP_SHARD_COLUMN : TP_SHARD_NONE;
+        // K3's MLA output gate wqkv_gate {n_embd, n_head*head_v} -> COLUMN by head. Arch-gated: ATTN_GATE
+        // is also the GDN mixer z-gate (qwen3next/35) and a full-attn gate (laguna/step35/afmoe) — those
+        // must stay replicated / go through their own paths, so only shard it for K3.
+        case LLM_TENSOR_ATTN_GATE:
+            return (attn && arch == LLM_ARCH_KIMI_K3) ? TP_SHARD_COLUMN : TP_SHARD_NONE;
         // MoE routed experts. gate_inp (router) stays replicated so every rank routes identically.
         //   EXPERT mode: shard the n_expert dim (ne[2]) — each rank owns whole experts.
         //   TENSOR mode: shard each expert's intermediate n_ff like a dense FFN — gate/up COLUMN
@@ -1471,6 +1481,37 @@ static int tp_gdn_plan_for(llm_arch arch, llm_tensor t, const llama_hparams & hp
     return 1;
 }
 
+// K3-only: shard the KDA (Kimi delta-net) GATE tensors by head under --tp-attn. K3's KDA is R=1
+// (num_k == num_v == n_head, no GQA), so every split is a single contiguous whole-head slice — far
+// simpler than tp_gdn_plan_for's strided runs. The head-carrying projections wq/wk/wv (ATTN_Q/K/V)
+// and wo (ATTN_OUT) shard via their existing attention roles; ssm_f_a and ssm_o_norm stay REPLICATED
+// (return 0 -> role NONE). These SSM_* tensor names are shared with real SSM/GDN archs, so gate on
+// KIMI_K3 and fire only under --tp-attn. Returns 0 for non-K3 / unhandled tensors (fall through),
+// 1 with the plan filled, or -1 on a divisibility / block-alignment refusal.
+static int tp_kda_plan_for(llm_arch arch, llm_tensor t, int rank, int size,
+                           const ggml_tensor * cur, tp_shard_plan * out) {
+    if (arch != LLM_ARCH_KIMI_K3) return 0;
+    tp_shard_role role;
+    switch (t) {
+        case LLM_TENSOR_SSM_BETA:      // {n_embd, n_head}     -> split n_head  (ne1)
+        case LLM_TENSOR_SSM_F_B:       // {head_dim, d_inner}  -> split d_inner (ne1)
+        case LLM_TENSOR_SSM_G:         // {n_embd, d_inner}    -> split d_inner (ne1)
+            role = TP_SHARD_COLUMN; break;
+        case LLM_TENSOR_SSM_CONV1D_Q:
+        case LLM_TENSOR_SSM_CONV1D_K:
+        case LLM_TENSOR_SSM_CONV1D_V:  // {d_conv, 1, d_inner} -> split d_inner (ne2 depthwise channels)
+            role = TP_SHARD_EXPERT; break;
+        case LLM_TENSOR_SSM_DT:        // bias {d_inner} (1-D F32) -> split d_inner (ne0)
+            role = TP_SHARD_ROW; break;
+        case LLM_TENSOR_SSM_A:         // {n_head} or {1,n_head} (1-D F32) -> split n_head
+            role = (cur->ne[1] > 1) ? TP_SHARD_COLUMN : TP_SHARD_ROW; break;
+        default:
+            return 0;  // wq/wk/wv/wo (attn roles), ssm_f_a / ssm_norm (replicate), MLA tensors
+    }
+    return tp_shard_plan_make(role, rank, size, cur->ne[0], cur->ne[1], cur->ne[2],
+                              ggml_blck_size(cur->type), ggml_type_size(cur->type), out) == 0 ? 1 : -1;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1717,6 +1758,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.attn) {
         // Fused QKV attention weight/bias needs the per-head multi-segment gather (hparams-aware).
         const int r = tp_qkv_plan_for(tn.tensor, hparams, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
+        if (r == 1)       { tp_sharded = true; }
+        else if (r == -1) { tp_refused = true; }
+    }
+    if (!tp_sharded && !tp_refused && tp_cfg.enabled && tp_cfg.attn) {
+        // K3 KDA (delta-net) gate tensors are SSM-named, so the attn roles below don't touch them;
+        // shard them by head here (contiguous whole-head slices) so they match the divided n_head.
+        const int r = tp_kda_plan_for(get_arch(), tn.tensor, tp_cfg.rank, tp_cfg.size, cur, &tp_plan);
         if (r == 1)       { tp_sharded = true; }
         else if (r == -1) { tp_refused = true; }
     }
