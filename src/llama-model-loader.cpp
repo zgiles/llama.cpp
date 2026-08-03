@@ -1786,7 +1786,41 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (!tp_sharded && !tp_refused && tp_cfg.enabled) {
         tp_shard_role tp_role = tp_role_for_tensor(get_arch(), tn.tensor, tp_cfg.attn, tp_cfg.ssm, tp_cfg.moe_mode);
         if (tp_role != TP_SHARD_NONE) {
-            if (tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, cur->ne[0], cur->ne[1], cur->ne[2],
+            // Dense (non-expert) FFN block-alignment fallback. gate/up split COLUMN (needs only
+            // n_ff % size == 0) but ffn_down splits ROW on the contraction (n_ff), which must stay
+            // quant-block-aligned: n_ff % (size*block) == 0. At TP sizes where those disagree (e.g.
+            // K3 n_ff=33792, q4_K block 256: gate/up shard at size 8 but ffn_down's row-split would
+            // cut a quant block and refuse) we'd load an inconsistent gate/up-sharded + down-refused
+            // FFN. Rather than fail the load, REPLICATE the whole dense FFN on every rank: each rank
+            // computes it in full and the graph skips the ffn_down all-reduce (see build_ffn). This is
+            // only the leading dense layer(s) (n_layer_dense_lead — 1 for K3), so the redundant read is
+            // <1% of the per-token bytes, and it unblocks 8/16-way TP that the dense FFN alone gates.
+            // Only fires when the shape actually requires it — sizes that divide cleanly (2,4 for K3)
+            // still shard as before. Test against block 256 (the max quant block) so the decision is
+            // identical for gate/up/down regardless of their individual quant types; a coarser type is
+            // then guaranteed shardable too. (Fused gate/up — Phi-3 — is handled earlier by
+            // tp_gate_up_plan_for and never reaches here, so no shard/replicate mix is possible.)
+            // TODO: group-replicate (shard to the largest block-aligned divisor, replicate across the
+            // leftover rank groups) would cut this to n_ff/4 per rank; not worth the complexity yet.
+            // TODO(hardening): key the block on ffn_down's actual type (look up the sibling meta) so
+            // block<256 FFNs (q8_0/q4_0/f16) shard when they can instead of over-replicating; and
+            // propagate this decision to the graph explicitly (a replicated-layer flag) rather than the
+            // build_ffn heuristic down->ne[0]==n_ff(il), which misfires on archs whose dense ffn_down
+            // width != n_ff (Arctic residual MLP, Qwen-1 n_ff/2). Also mirror this replicate criterion
+            // into tp_gate_up_plan_for for fused gate/up so a fused-up shard + down replicate can't mix.
+            // Restrict to 2-D weight matrices: 1-D FFN biases/scalars share these enums and must not
+            // take the replicate path (a replicated bias against a sharded activation asserts in add).
+            const bool dense_ffn = (tn.tensor == LLM_TENSOR_FFN_GATE ||
+                                    tn.tensor == LLM_TENSOR_FFN_UP   ||
+                                    tn.tensor == LLM_TENSOR_FFN_DOWN) &&
+                                   ggml_n_dims(cur) == 2 &&
+                                   tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0;
+            const int64_t n_ff_axis = (tp_role == TP_SHARD_ROW) ? cur->ne[0] : cur->ne[1];
+            const bool dense_ffn_replicate = dense_ffn &&
+                (n_ff_axis % ((int64_t) tp_cfg.size * 256) != 0);
+            if (dense_ffn_replicate) {
+                // leave tp_sharded=false, tp_refused=false -> falls through to the replicate (dup) path
+            } else if (tp_shard_plan_make(tp_role, tp_cfg.rank, tp_cfg.size, cur->ne[0], cur->ne[1], cur->ne[2],
                                    ggml_blck_size(cur->type), ggml_type_size(cur->type), &tp_plan) == 0) {
                 tp_sharded = true;
             } else {
@@ -1815,6 +1849,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     } else {
         tensor = ggml_dup_tensor(ctx, cur);
         ggml_set_name(tensor, ggml_get_name(cur));
+        if (getenv("LLAMA_TP_GDN_DEBUG")) {
+            const char * nm = ggml_get_name(cur);
+            if (strstr(nm, "_exps") || strstr(nm, "shexp")) {
+                tp_shard_role r = tp_cfg.enabled
+                    ? tp_role_for_tensor(get_arch(), tn.tensor, tp_cfg.attn, tp_cfg.ssm, tp_cfg.moe_mode)
+                    : TP_SHARD_NONE;
+                LLAMA_LOG_INFO("tp_replicate(FULL): '%s' [%lld,%lld,%lld] role=%d moe_mode=%d enabled=%d\n",
+                    nm, (long long)cur->ne[0], (long long)cur->ne[1], (long long)cur->ne[2],
+                    (int)r, (int)tp_cfg.moe_mode, (int)tp_cfg.enabled);
+            }
+        }
     }
 
     if (duplicated) {

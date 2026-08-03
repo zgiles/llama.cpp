@@ -1759,7 +1759,13 @@ ggml_tensor * llm_graph_context::build_ffn(
     // --tp-ssm/--tp-attn has MoE *disabled* but still has a replicated shared expert, which the old
     // `!llama_tp_moe_enabled()` guard failed to suppress -> the shexp got double-counted -> garbage.
     // (The MoE routed-expert combine is all-reduced separately in build_moe_ffn.)
-    const bool down_replicated = down && strstr(down->name, "shexp") != nullptr;
+    // A dense FFN that couldn't be block-aligned-sharded at this TP size is REPLICATED whole on every
+    // rank (see llama-model-loader.cpp): its ffn_down keeps the full contraction width (n_ff), so each
+    // rank already holds the complete output — all-reducing would multiply it by tp_size. A sharded
+    // ffn_down instead has ne[0] == n_ff/size and holds only a partial sum that must be all-reduced.
+    const bool dense_ffn_replicated = down && llama_tp_enabled() &&
+        down->ne[0] == (int64_t) hparams.n_ff(il);
+    const bool down_replicated = (down && strstr(down->name, "shexp") != nullptr) || dense_ffn_replicated;
     if (down && llama_tp_enabled() && !down_replicated) {
         cur = ggml_map_custom1_inplace(ctx0, cur, llama_tp_allreduce_op, 1, nullptr);
         cb(cur, "ffn_down_tp", il);
