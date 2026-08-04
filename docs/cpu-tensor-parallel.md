@@ -282,12 +282,19 @@ DeepSeek-V3.1 (256 experts × `n_ff` 2048 — *medium*):
 Kimi-K3 (2.78 T; hybrid KDA-delta-net + MLA attention, 896 experts, Q2_K), `ep` (expert-parallel) with and
 without attention sharding (`LLAMA_TP_ATTN=1`):
 
-| config | ranks | pp | tg |
-|---|---|---|---|
-| ep (attention replicated) | 2 | 4.2 | 1.3 |
-| ep **+ `tp-attn`** | 2 | 4.8 | **1.6** |
-| ep (attention replicated) | 4 | 3.9 | 1.0 |
-| ep **+ `tp-attn`** | 4 | **5.9** | **2.0** |
+| config | ranks | nodes | pp | tg |
+|---|---|---|---|---|
+| ep (attention replicated) | 2 | 1 | 4.2 | 1.3 |
+| ep **+ `tp-attn`** | 2 | 1 | 4.8 | **1.6** |
+| ep (attention replicated) | 4 | 2 | 3.9 | 1.0 |
+| ep **+ `tp-attn`** | 4 | 2 | **5.9** | **2.0** |
+| ep **+ `tp-attn`** | 8 | 4 | 0.96 | 1.97 |
+
+8-way was previously blocked at load (dense FFN `n_ff` not block-aligned at 8) and at graph-reserve (a
+tensor-parallel shard landing in the CPU repack buffer it couldn't repack); both are fixed (dense-FFN
+replicate fallback + repack base-matmul fallback). Decode is **flat 4→8** (2.0 → 1.97): the sharded work
+keeps shrinking but the *replicated* shared expert (read every token on every rank) and the per-layer
+all-reduce barrier cap scaling past ~4 ranks. More ranks past 4 buys **capacity, not speed**.
 
 **K3 decode is ~⅘ attention** (the trunk weights are read every token, while only 16/896 experts fire). With
 attention *replicated*, adding ranks does nothing for that dominant cost — decode actually *regresses* 2→4
@@ -295,6 +302,45 @@ ranks (1.3 → 1.0) as expert-parallel imbalance grows. With `tp-attn` the atten
 heads and the MLA heads) shards too, so decode **scales**: 1.6 → 2.0 going 2 → 4 ranks — 2× the
 attention-replicated 4-rank number, and 4× the naive single-process baseline. This is the case where
 `tp-attn` matters most.
+
+DeepSeek-V4-Flash-0731 (`deepseek4` arch; 256 experts top-6, 1 shared, 43 layers, Q8_K_XL, 150 GB), `ep`
+(expert-parallel). `--tp-attn` is **not yet supported** for `deepseek4` (single latent KV head + a novel
+Q-lora/O-lora/compressed-KV/sinks/hyper-connection/DSA-indexer attention block); these are expert-parallel
+only, attention replicated:
+
+| config | ranks | nodes | pp | tg |
+|---|---|---|---|---|
+| S2 (1 process, both sockets) | 1 | 1 | 20.0 | 2.27 |
+| ep | 2 | 1 | 3.4 | **3.74** |
+| ep | 4 | 2 | (short-prompt, noisy) | 3.79 |
+| ep | 8 | 4 | (short-prompt, noisy) | 3.60 |
+
+The whole 150 GB model fits one node, so decode peaks at the **1-node, 2-rank** config (3.74 — the NUMA-local
+win over the naive both-sockets process) and multi-node adds neither speed nor needed capacity. (pp on the
+short 12-token benchmark prompt is dominated by fixed per-run overhead once cross-node — measure prefill with
+a long prompt if it matters.)
+
+### Commands used for these runs
+
+`rank = socket`; one `llama-completion` process per rank, NUMA-pinned, all reading the same GGUF over the
+shared filesystem. Rank 0 listens; every other rank connects to rank 0's InfiniBand address. The **MoE mode
+must be set on the CLI** (`--moe-parallel expert`) — when `--tp-size` is passed, the active config overrides
+the `LLAMA_TP_MOE` env, so the env form is silently ignored and experts end up *replicated* (OOM / no
+distribution).
+
+```bash
+# Per rank R on socket S (of tp_size N). PEER = rank-0's IB addr; omit --tp-peer on rank 0.
+UCX_TLS=rc,sm,self UCX_NET_DEVICES=mlx5_0:1 LLAMA_TP_CONNECT_SECS=2400 \
+numactl --cpunodebind=$S --preferred=$S \
+  llama-completion -m MODEL-00001-of-000NN.gguf -t 24 -c 4096 -n 64 --file prompt.txt \
+    -no-cnv --no-warmup --no-mmap --temp 0 --seed 7 --ignore-eos \
+    --tp-size $N --tp-rank $R --tp-port 30500 [--tp-peer 192.168.100.121] \
+    --moe-parallel expert            # K3 adds:  --tp-attn   (deepseek4 does not support it yet)
+```
+
+Node/rank map used on the tonto cluster (2 sockets/node): 2-rank = node A sockets 0,1; 4-rank = +node B;
+8-rank = +nodes C,D (Cascade-Lake node included). Build with repack on (default) — the repack fix makes
+8-way work and repack gives ~1.6× decode over `-DGGML_CPU_REPACK=OFF`.
 
 Takeaways:
 
