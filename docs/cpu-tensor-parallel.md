@@ -303,22 +303,37 @@ heads and the MLA heads) shards too, so decode **scales**: 1.6 → 2.0 going 2 �
 attention-replicated 4-rank number, and 4× the naive single-process baseline. This is the case where
 `tp-attn` matters most.
 
-DeepSeek-V4-Flash-0731 (`deepseek4` arch; 256 experts top-6, 1 shared, 43 layers, Q8_K_XL, 150 GB), `ep`
-(expert-parallel). `--tp-attn` is **not yet supported** for `deepseek4` (single latent KV head + a novel
-Q-lora/O-lora/compressed-KV/sinks/hyper-connection/DSA-indexer attention block); these are expert-parallel
-only, attention replicated:
+DeepSeek-V4-Flash-0731 (`deepseek4` arch; 256 experts top-6 × `n_ff` 2048, 1 shared, 43 layers, Q8_K_XL,
+150 GB) — `ep` vs `tp` MoE modes. `--tp-attn` is **not yet supported** for `deepseek4` (single latent KV
+head + a novel Q-lora/O-lora/compressed-KV/sinks/hyper-connection/DSA-indexer attention block), so attention
+is replicated in all rows. `tg` = decode tokens/s (`pp` omitted — the 12-token benchmark prompt makes prefill
+noise-dominated cross-node; Cascade's VNNI gives a clear prefill win only on a long prompt):
 
-| config | ranks | nodes | pp | tg |
+| mode | ranks | nodes | CPU | tg |
 |---|---|---|---|---|
-| S2 (1 process, both sockets) | 1 | 1 | 20.0 | 2.27 |
-| ep | 2 | 1 | 3.4 | **3.74** |
-| ep | 4 | 2 | (short-prompt, noisy) | 3.79 |
-| ep | 8 | 4 | (short-prompt, noisy) | 3.60 |
+| S2 (1 process, both sockets) | 1 | 1 | Skylake | 2.27 |
+| ep | 2 | 1 | Skylake | 3.74 |
+| **tp** | 2 | 1 | Skylake | 3.78 |
+| ep | 4 | 2 | Skylake | 3.79 |
+| **tp** | 4 | 2 | Skylake | **3.91** |
+| ep | 8 | 4 | Skylake | 3.60 |
+| **tp** | 8 | 4 | Skylake | 3.86 |
+| ep | 2 | 1 | Cascade-VNNI | 3.58 |
+| tp | 2 | 1 | Cascade-VNNI | 3.70 |
 
-The whole 150 GB model fits one node, so decode peaks at the **1-node, 2-rank** config (3.74 — the NUMA-local
-win over the naive both-sockets process) and multi-node adds neither speed nor needed capacity. (pp on the
-short 12-token benchmark prompt is dominated by fixed per-run overhead once cross-node — measure prefill with
-a long prompt if it matters.)
+Unlike K3, deepseek4 decode is **not** attention-bound — its MLA+DSA(sparse) attention is cheap, so the ~96%
+that is experts dominates. Decode is bandwidth-saturated around **3.7–3.9** and the config choices move it
+only a few percent, but the pattern is consistent and instructive:
+
+* **`tp` ≥ `ep` at every scale, and `tp` scales where `ep` doesn't.** With 256 experts and only 6 firing per
+  token, `ep` lands those 6 unevenly across ranks; the per-layer barrier waits on the busiest rank, so `ep`
+  peaks at 4 and **regresses at 8** (3.79 → 3.60). `tp` splits every expert's `n_ff` so all ranks do exactly
+  `1/N` of the work every token — balanced — so it **peaks at 4 (3.91) and holds at 8 (3.86)**. `tp`'s sweet
+  spot is ~4 ranks, *not* one node.
+* **Cascade Lake ≈ Skylake for decode** (bandwidth-bound; VNNI doesn't help the memory-bound path), but VNNI
+  gives Cascade a large **prefill** advantage. `tp` beats `ep` on Cascade too (3.70 vs 3.58).
+* **Practical pick:** `tp` at 2 ranks on one node (3.78, fits in one node's RAM) for simplicity, or `tp` at 4
+  ranks (3.91) for the last few percent. Multi-node is a *modest* decode win here and mainly a capacity tool.
 
 ### Commands used for these runs
 
