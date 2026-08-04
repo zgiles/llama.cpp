@@ -4736,6 +4736,13 @@ static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buff
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
     auto tensor_traits = (ggml::cpu::repack::tensor_traits_base *) tensor->extra;
+    if (tensor_traits == nullptr) {
+        // in the repack buffer but not repackable at this shape (e.g. a tensor-parallel shard) ->
+        // store in normal quant layout; supports_op/compute fall back to the base CPU matmul.
+        memcpy(tensor->data, data, size);
+        GGML_UNUSED(buffer);
+        return;
+    }
     auto OK            = tensor_traits->repack(tensor, data, size);
 
     GGML_ASSERT(OK == 0);
@@ -4772,37 +4779,28 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-        if (    op->op == GGML_OP_MUL_MAT &&
-                op->src[0]->buffer &&
-                (ggml_n_dims(op->src[0]) == 2) &&
-                op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
-                ) {
+        // MUL_MAT (2-D src0) / MUL_MAT_ID (3-D src0) whose weight is allocated in the repack buffer.
+        const bool is_mm    = op->op == GGML_OP_MUL_MAT    && op->src[0]->buffer &&
+                              ggml_n_dims(op->src[0]) == 2 &&
+                              op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+        const bool is_mm_id = op->op == GGML_OP_MUL_MAT_ID && op->src[0]->buffer &&
+                              ggml_n_dims(op->src[0]) == 3 &&
+                              op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type();
+        if (is_mm || is_mm_id) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
-                return true;
+            if (ggml_repack_get_optimal_repack_type(op->src[0])) {
+                // src0 is actually repacked -> repacked matmul path (needs a host F32 activation).
+                return op->src[1]->type == GGML_TYPE_F32;
             }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
-            // may be possible if Q8_0 packed...
-        } else if (op->op == GGML_OP_MUL_MAT_ID
-                && op->src[0]->buffer
-                && (ggml_n_dims(op->src[0]) == 3)
-                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
-                ) {
-            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
-                return false;
-            }
-            if (op->src[1]->type == GGML_TYPE_F32) {
-                return true;
-            }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
+            // src0 sits in the repack buffer but is NOT repackable at this shape (e.g. a tensor-
+            // parallel shard whose row count isn't a multiple of the interleave factor). init_tensor
+            // left extra==NULL and set_tensor stored it in normal quant layout, and the compute
+            // dispatch falls back to the base matmul when the trait is NULL (traits.cpp). So defer to
+            // base CPU support here instead of returning false and making the op unschedulable.
+            return op->src[1]->type == GGML_TYPE_F32 ||
+                   op->src[1]->type == ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot_type;
         }
         return false;
     }
