@@ -1807,7 +1807,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+            // a zero-sized host buffer has no base pointer (get_base is documented as optional in
+            // that case and returns NULL), which would abort in llama_mlock::grow_to. This happens
+            // whenever tensors are offloaded, e.g. -ngl 99 leaves an empty CPU context behind.
+            if (use_mlock && ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_size(buf) > 0) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
                 mlock_buf->init   (ggml_backend_buffer_get_base(buf));
