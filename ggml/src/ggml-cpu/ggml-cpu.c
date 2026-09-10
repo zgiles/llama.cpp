@@ -1670,6 +1670,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // NUMA mirroring: read the expert weights from this thread's node-local copy. Resolved once per
+    // op (not per expert or per row), and returns src0->data unchanged when mirroring is disabled.
+    const char * const src0_data = (const char *) ggml_numa_mirror_local(src0->data);
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1684,7 +1688,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = src0_data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1880,6 +1881,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // NUMA weight mirroring (GGML_NUMA_MIRROR=1): now that the weights are loaded, give every NUMA
+    // node its own copy of the host-resident buffers so CPU threads read locally instead of across
+    // the interconnect. Must happen AFTER load_all_data — the mirrors are snapshots. Weights are
+    // read-only from here on, so no coherence is needed. No-op unless enabled and n_nodes > 1.
+    if (ggml_numa_mirror_enabled()) {
+        // Mirror only the ROUTED EXPERT tensors — they are what mul_mat_id streams (~1 GB/token),
+        // and mul_mat_id is the only hook. Mirroring whole buffers would also copy
+        // per_layer_token_embd (26.8 GiB), and GET_ROWS is not hooked, so those copies would never
+        // be read. Not worth hooking either: one gathered PLE row is ~90 bytes, negligible against
+        // the expert stream.
+        size_t n_mirrored = 0;
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                    continue;
+                }
+                if (strstr(t->name, "ffn_gate_exps") == nullptr &&
+                    strstr(t->name, "ffn_down_exps") == nullptr &&
+                    strstr(t->name, "ffn_up_exps")   == nullptr) {
+                    continue;
+                }
+                if (ggml_numa_mirror_register(t->data, ggml_nbytes(t))) {
+                    n_mirrored++;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: NUMA-mirrored %zu expert tensors\n", __func__, n_mirrored);
     }
 
     return true;
