@@ -36,6 +36,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #if defined(__APPLE__)
@@ -344,6 +345,25 @@ void * ggml_aligned_malloc(size_t size) {
         return NULL;
     }
     void * aligned_memory = NULL;
+  #if defined(__gnu_linux__) && !defined(GGML_USE_CPU_HBM)
+    // Opt-in transparent huge pages for large buffers (GGML_HUGEPAGE=1).
+    // Model weight buffers are tens of GiB; at 4 KiB a 50 GiB expert set needs ~13M TLB entries,
+    // and a MoE gather touches them in random order. 2 MiB pages cut that by 512x.
+    // Two things are required and neither happens by default: the region must be 2 MiB-aligned
+    // (posix_memalign with a 64-byte alignment is not), and, because distros commonly ship
+    // /sys/kernel/mm/transparent_hugepage/enabled as "madvise", THP is never applied unless we
+    // ask for it explicitly. Only anonymous memory can be promoted, so this affects
+    // --load-mode none/mlock; a file mmap (especially over NFS) cannot use it.
+    if (size >= (2u << 20)) {
+        const char * hp = getenv("GGML_HUGEPAGE");
+        if (hp && atoi(hp) != 0 && posix_memalign(&aligned_memory, 2u << 20, size) == 0) {
+            // advisory: if THP is unavailable the kernel just keeps 4 KiB pages
+            (void) madvise(aligned_memory, size, MADV_HUGEPAGE);
+            return aligned_memory;
+        }
+        aligned_memory = NULL;
+    }
+  #endif
   #ifdef GGML_USE_CPU_HBM
     int result = hbw_posix_memalign(&aligned_memory, alignment, size);
   #elif TARGET_OS_OSX
