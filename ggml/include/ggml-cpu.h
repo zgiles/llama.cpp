@@ -140,6 +140,19 @@ extern "C" {
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    // NUMA weight mirroring (opt-in via GGML_NUMA_MIRROR=1).
+    // On a multi-socket box the weights sit on whichever node faulted them in, so half the threads
+    // read across the interconnect. Measured on 2x Xeon 8260: 102 GB/s node-local, but only
+    // 126 GB/s interleaved across both (UPI caps cross-node reads), vs 204 GB/s when each socket
+    // reads its own copy. Weights are read-only after load, so a per-node copy needs no coherence.
+    GGML_BACKEND_API bool         ggml_numa_mirror_enabled (void);
+    // Snapshot [base, base+size) onto every NUMA node. Call AFTER the buffer is filled.
+    GGML_BACKEND_API bool         ggml_numa_mirror_register(void * base, size_t size);
+    // Map a pointer into the calling thread's node-local copy; returns `p` unchanged if mirroring
+    // is off or `p` is not in a registered buffer, so callers need no fallback path.
+    GGML_BACKEND_API const void * ggml_numa_mirror_local   (const void * p);
+    GGML_BACKEND_API void         ggml_numa_mirror_free_all(void);
+
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);
