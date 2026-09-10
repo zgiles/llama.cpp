@@ -261,6 +261,22 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         }
     }
 
+    // also expose the CPU's extra buffer types (e.g. CPU_REPACK), the same set make_cpu_buft_list()
+    // considers. Without this, -ot can only name a device's DEFAULT buffer type, so an override to
+    // the CPU silently opts the tensor out of repacking — which is what -ncmoe/-cmoe do today.
+    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts_fn) {
+            ggml_backend_buffer_type_t * extra = get_extra_bufts_fn(cpu_dev);
+            while (extra && *extra) {
+                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+                ++extra;
+            }
+        }
+    }
+
     for (const auto & override : string_split<std::string>(value, ',')) {
         std::string::size_type pos = override.find('=');
         if (pos == std::string::npos) {
