@@ -3849,7 +3849,14 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, 0, kq_scale, il);
+    // n_kv_max = top_k->ne[0], which IS glm5next_n_select (indexer_top_k + indexer_kpool - 1 = 2051,
+    // see src/models/glm5next.cpp:9-17 and the [n_select, ...] shape documented in llama-graph.h).
+    // Passing 0 here disabled upstream's sparse-FA gather (it requires n_kv_max > 0,
+    // ggml/src/ggml-cuda/fattn.cu:138), so FA ran DENSE over the full n_kv: flat in memory but
+    // O(n_kv) in time, and top_k bought nothing. The glm-dsa path already passes top_k->ne[0]
+    // (llama-graph.cpp ~3150). Upstream omission: sparse-FA landed in #27970 AFTER PR #27754's
+    // graph code was written, so glm5next was never wired into it.
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
