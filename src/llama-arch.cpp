@@ -165,7 +165,15 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAION_CODER,      "maion-coder"      },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_KIMI_K3,          "kimi-k3"          },
-    { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
+    // NOTE(fork): upstream names this arch "glm5-next", but every GLM-5.3-Flash GGUF in the wild
+    // was produced against PR #27754 (unsloth's, which lost to #27773) and declares
+    // general.architecture = "glm5next". The arch name is also the prefix for all 40 of this model's
+    // metadata keys (LLM_KV::operator() formats with LLM_ARCH_NAMES), so the name must match the
+    // file or nothing resolves. Tensor names already match upstream exactly, and the only two keys
+    // upstream reads that these files lack (indexer.kpool_select_tail, indexer.types) are optional
+    // with defaults -- so this rename is the ONLY change needed.
+    // DROP THIS when unsloth re-releases against upstream's naming; then the stock name works.
+    { LLM_ARCH_GLM5_NEXT,        "glm5next"         },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
